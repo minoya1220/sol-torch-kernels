@@ -7,10 +7,11 @@ K = 4
 
 
 def error(x: torch.Tensor, ref: torch.Tensor) -> float:
-    """Largest error of x, in units of eps of x's dtype, over the elements where ref is finite.
-    Small entries are measured against the largest entry, not against themselves."""
+    """Largest error of x, in units of eps of x's dtype, over the elements where ref rounded
+    to x's dtype is finite. Small entries are measured against the largest entry, not
+    against themselves."""
     info = torch.finfo(x.dtype)
-    finite = ref.isfinite()
+    finite = ref.to(x.dtype).isfinite()
     r = ref[finite]
     if r.numel() == 0:
         return 0.0
@@ -22,8 +23,14 @@ def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor) -> str | None:
     """None if y passes, else why it fails. t is torch's result on the same inputs."""
     if y.shape != t.shape or y.dtype != t.dtype:
         return f"got {tuple(y.shape)} {y.dtype}, torch gives {tuple(t.shape)} {t.dtype}"
-    special = ~ref.isfinite()
-    ys, rs = y.double()[special], ref[special]
+    if y.dtype == torch.bool:  # comparisons have exactly one right answer
+        wrong = (y != ref).sum().item()
+        return f"{wrong} of {y.numel()} elements differ from the reference" if wrong else None
+    # A reference too large for y's dtype rounds to inf, and y must be inf there too.
+    # Measured as finite, it gave torch an infinite error and so an infinite bound.
+    rounded = ref.to(y.dtype)
+    special = ~rounded.isfinite()
+    ys, rs = y[special].double(), rounded[special].double()
     nan = rs.isnan()
     if not torch.equal(ys.isnan(), nan) or not torch.equal(ys[~nan], rs[~nan]):
         return "does not match the reference where it is NaN or inf"

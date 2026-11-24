@@ -34,7 +34,7 @@ Per element, with `eps` the machine epsilon of the output dtype:
 ```
 s_i  = max(|r_i|, eps * max_j |r_j|, smallest normal of the dtype)
 e_i(x) = |x_i - r_i| / (eps * s_i)
-E(x) = max of e_i(x) over the elements where r_i is finite
+E(x) = max of e_i(x) over the elements where r_i, rounded to the output dtype, is finite
 pass: E(y) <= 4 * max(E(t), 1)
 ```
 
@@ -45,7 +45,7 @@ Why this rule and not a fixed `atol` and `rtol`:
 - The scale `s_i` gives relative error for large entries and absolute error, at the size of the largest entry, for entries far below it. Pure relative error is meaningless where the backward cancels to near zero.
 - The factor 4 allows a different summation order with float32 accumulation. It should reject accumulation in a 16-bit type. That is an expectation, not yet tested by an exploit.
 
-Where `r_i` is NaN or infinite, `y_i` must be NaN or the same infinity. A NaN where `r_i` is finite makes `E` NaN, which fails.
+Where `r_i`, rounded to the output dtype, is NaN or infinite, `y_i` must be NaN or the same infinity, so a result too large for the dtype must overflow. Measured as finite instead, such an element gave torch an infinite error and so an infinite bound. A NaN where the rounded `r_i` is finite makes `E` NaN, which fails. A bool result, from a comparison, must equal the reference exactly.
 
 ### Cases
 

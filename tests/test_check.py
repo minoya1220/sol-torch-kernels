@@ -29,3 +29,23 @@ def test_finite_where_reference_is_nan_fails():
     ref[0] = float("nan")  # softmax of a row that is all -inf
     y = ref.float().nan_to_num(0.0)
     assert compare(y, ref.float(), ref) is not None
+
+
+def test_result_must_overflow_where_the_reference_does():
+    # exp(12) is finite in float64 but above float16's largest value, so torch gives inf.
+    # Measured as a finite reference, that was an infinite error for torch and so an
+    # infinite bound, under which any finite result passed.
+    x = torch.tensor([[12.0, 1.0, -1.0, 0.5]], dtype=torch.float16)
+    t, ref = torch.exp(x), torch.exp(x.double())
+    garbage = torch.where(t.isinf(), t, 3.0).half()
+    assert compare(garbage, t, ref) is not None
+    assert compare(t.clone(), t, ref) is None
+
+
+def test_comparison_must_match_exactly():
+    a, b = REF[0], REF[1]
+    ref = a < b
+    y = (a.float() < b.float()).clone()
+    assert compare(y, y.clone(), ref) is None
+    y[0] = ~y[0]
+    assert compare(y, y.clone(), ref) is not None
