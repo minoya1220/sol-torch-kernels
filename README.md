@@ -2,13 +2,12 @@
 
 Speed-of-light PyTorch op kernels for NVIDIA Blackwell (sm120), written in CuTe DSL.
 
-Status: no kernels yet. The evaluation harness is designed first; see [docs/eval-design.md](docs/eval-design.md).
+Status: the evaluation harness and the first op (softmax forward and backward) are being built. See [docs/eval-design.md](docs/eval-design.md) for how kernels are judged and [AGENTS.md](AGENTS.md) for how the repo is worked on.
 
 ## Layout
 
-- `src/sol_kernels/`: the kernel library.
-- `src/sol_eval/`: the test and benchmark harness (protected path).
-- `docs/eval-design.md`: harness design (protected path).
+- `src/sol_kernels/`: the kernels.
+- `src/sol_eval/`: the harness that checks and times them.
 
 ## Setup
 
@@ -16,4 +15,4 @@ Status: no kernels yet. The evaluation harness is designed first; see [docs/eval
 uv sync
 ```
 
-Requires an NVIDIA GPU with compute capability 12.0 (sm120) to run kernels.
+Running kernels needs an NVIDIA GPU with compute capability 12.0 (sm120).
