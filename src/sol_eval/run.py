@@ -1,6 +1,7 @@
-"""Check and time one op on this machine's GPU.
+"""Check and time one op, or every op, on this machine's GPU.
 
     python -m sol_eval.run softmax_fwd [--heldout] [--json report.json]
+    python -m sol_eval.run --all [--heldout] [--json report.json]
 
 --heldout runs the held-out cases instead of the dev cases; it needs SOL_HELDOUT_SEED.
 Exits with status 1 if any case fails.
@@ -10,9 +11,8 @@ import argparse
 import importlib.metadata
 import json
 import sys
-from pathlib import Path
-
 from dataclasses import replace
+from pathlib import Path
 
 import torch
 
@@ -54,46 +54,79 @@ def run_performance(op, build, case, peak_gbps) -> dict:
             "sol": gbps / peak_gbps, "torch_us": torch_us, "speedup": torch_us / us}
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("op", choices=OPS)
-    parser.add_argument("--heldout", action="store_true")
-    parser.add_argument("--json", type=Path)
-    args = parser.parse_args()
-    op = OPS[args.op]
+def correctness_cases(op, heldout):
+    return op.heldout_cases() if heldout else op.dev_cases()
 
-    cases = op.heldout_cases() if args.heldout else op.dev_cases()
-    correctness = run_correctness(op, op.build, cases)
-    peak = peak_bandwidth()
+
+def run_op(op, heldout, peak) -> dict:
+    correctness = run_correctness(op, op.build, correctness_cases(op, heldout))
     performance = [run_performance(op, op.build, case, peak) for case in op.perf_cases]
+    return {"op": op.name, "correctness": correctness, "performance": performance}
 
+
+def print_op(report):
+    correctness = report["correctness"]
     passed = sum(r["passed"] for r in correctness)
-    print(f"{op.name} on {torch.cuda.get_device_name()}: {passed}/{len(correctness)} correctness cases pass")
+    print(f"{report['op']}: {passed}/{len(correctness)} correctness cases pass")
     for r in correctness:
         if not r["passed"]:
             print(f"  FAIL {r['case']}: {r['failure']}")
-    print(f"peak copy bandwidth {peak:.0f} GB/s")
-    print(f"{'case':<32} {'us':>9} {'GB/s':>7} {'SoL':>6} {'torch us':>9} {'speedup':>8}")
-    for r in performance:
+    print(f"{'case':<48} {'us':>9} {'GB/s':>7} {'SoL':>6} {'torch us':>9} {'speedup':>8}")
+    for r in report["performance"]:
         if r["passed"]:
-            print(f"{r['case']:<32} {r['us']:>9.1f} {r['gbps']:>7.0f} {r['sol']:>6.2f} {r['torch_us']:>9.1f} {r['speedup']:>8.2f}")
+            print(f"{r['case']:<48} {r['us']:>9.1f} {r['gbps']:>7.0f} {r['sol']:>6.2f} {r['torch_us']:>9.1f} {r['speedup']:>8.2f}")
         else:
-            print(f"{r['case']:<32} FAIL {r['failure']}")
+            print(f"{r['case']:<48} FAIL {r['failure']}")
+
+
+def print_summary(reports):
+    """One line per op, then every failure."""
+    print(f"{'op':<14} {'correct':>9}  {'SoL':>11}  {'speedup':>11}")
+    for report in reports:
+        correctness, perf = report["correctness"], report["performance"]
+        timed = [r for r in perf if r["passed"]]
+        sol = f"{min(r['sol'] for r in timed):.2f}-{max(r['sol'] for r in timed):.2f}" if timed else "-"
+        speedup = f"{min(r['speedup'] for r in timed):.2f}-{max(r['speedup'] for r in timed):.2f}" if timed else "-"
+        passed = sum(r["passed"] for r in correctness)
+        print(f"{report['op']:<14} {passed:>4}/{len(correctness):<4}  {sol:>11}  {speedup:>11}")
+    for report in reports:
+        for r in report["correctness"] + report["performance"]:
+            if not r["passed"]:
+                print(f"FAIL {report['op']} {r['case']}: {r['failure']}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("op", choices=OPS, nargs="?")
+    parser.add_argument("--all", action="store_true", help="every op, with one summary line each")
+    parser.add_argument("--heldout", action="store_true")
+    parser.add_argument("--json", type=Path)
+    args = parser.parse_args()
+    if args.all == (args.op is not None):
+        parser.error("give one op or --all")
+    names = list(OPS) if args.all else [args.op]
+
+    peak = peak_bandwidth()
+    reports = [run_op(OPS[name], args.heldout, peak) for name in names]
+
+    print(f"{torch.cuda.get_device_name()}, peak copy bandwidth {peak:.0f} GB/s")
+    if args.all:
+        print_summary(reports)
+    else:
+        print_op(reports[0])
 
     if args.json:
         report = {
-            "op": op.name,
             "heldout": args.heldout,
             "device": torch.cuda.get_device_name(),
             "torch": torch.__version__,
             "cutlass_dsl": importlib.metadata.version("nvidia-cutlass-dsl"),
             "peak_gbps": peak,
-            "correctness": correctness,
-            "performance": performance,
+            "ops": reports,
         }
         args.json.write_text(json.dumps(report, indent=2))
 
-    all_passed = all(r["passed"] for r in correctness + performance)
+    all_passed = all(r["passed"] for report in reports for r in report["correctness"] + report["performance"])
     return 0 if all_passed else 1
 
 

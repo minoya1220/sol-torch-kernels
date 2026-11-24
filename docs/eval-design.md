@@ -89,7 +89,9 @@ A correct eager call says nothing about what the captured graph does. After timi
 
 ## Report
 
-`python -m sol_eval.run <op>` prints a table and writes JSON: device, torch and CuTe DSL versions, peak, then each correctness case (pass or fail, with the error) and each perf case (time, GB/s, SoL, torch time, speedup).
+`python -m sol_eval.run <op>` prints a table and writes JSON: device, torch and CuTe DSL versions, peak, then each correctness case (pass or fail, with the error) and each perf case (time, GB/s, SoL, torch time, speedup). `python -m sol_eval.run --all` does the same for every op in one process, with one peak measurement, and prints one line per op and then every failure.
+
+Compiling dominates a run. The elementwise kernel takes shapes and strides at run time, so one compile serves every case with the same dtypes, layout pattern and vector width, and `compile_kernel` keeps each compile in an `lru_cache`. Everything runs in one process, so a compile never runs while a kernel is timed. Softmax still compiles once per case, for its row length.
 
 ## Threat map
 
