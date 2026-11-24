@@ -1,27 +1,25 @@
 """Correctness: a result passes if it matches torch bit for bit (for ops that are one
-correctly rounded step), or if its error against the float64 reference is at most K times
-torch's own error on the same inputs. docs/eval-design.md says why."""
+correctly rounded step), or if, on every element, its error against the float64 reference
+is at most K times torch's own error on that element. docs/eval-design.md says why."""
 
 import torch
 
 # K per error rule. "max_scaled" (softmax) measures small entries against the largest one;
-# "per_element" (elementwise ops) measures every entry against itself.
-K = {"max_scaled": 4, "per_element": 2}
+# "relative" (elementwise ops) measures every entry against itself.
+K = {"max_scaled": 4, "relative": 2}
 
 
-def error(x: torch.Tensor, ref: torch.Tensor, rule: str) -> float:
-    """Largest error of x, in units of eps of x's dtype, over the elements where ref rounded
-    to x's dtype is finite."""
+def error(x: torch.Tensor, ref: torch.Tensor, rule: str) -> torch.Tensor:
+    """Error of each element of x, in units of eps of x's dtype, over the elements where ref
+    rounded to x's dtype is finite."""
     info = torch.finfo(x.dtype)
     finite = ref.to(x.dtype).isfinite()
     r = ref[finite]
-    if r.numel() == 0:
-        return 0.0
     floor = info.tiny
-    if rule == "max_scaled":
+    if rule == "max_scaled" and r.numel() > 0:
         floor = max(info.eps * r.abs().max().item(), info.tiny)
     scale = r.abs().clamp_min(floor)
-    return ((x.double()[finite] - r).abs() / (info.eps * scale)).max().item()
+    return (x.double()[finite] - r).abs() / (info.eps * scale)
 
 
 def bits(x: torch.Tensor) -> torch.Tensor:
@@ -48,10 +46,15 @@ def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str) -> s
     nan = rs.isnan()
     if not torch.equal(ys.isnan(), nan) or not torch.equal(ys[~nan], rs[~nan]):
         return "does not match the reference where it is NaN or inf"
+    # Each element against torch's error on the same element: one element where torch's
+    # formula underflows must not loosen the bound on all the others.
     e_y, e_t = error(y, ref, rule), error(t, ref, rule)
-    bound = K[rule] * max(e_t, 1.0)
-    if not e_y <= bound:  # also fails when e_y is NaN
-        return f"error {e_y:.3g} ulp, bound {bound:.3g} (torch {e_t:.3g})"
+    bound = K[rule] * e_t.clamp_min(1.0)
+    bad = ~(e_y <= bound)  # also catches NaN
+    if bad.any():
+        i = (e_y / bound).nan_to_num(float("inf")).argmax()
+        return (f"{bad.sum().item()} elements over the bound; worst error {e_y[i].item():.3g} ulp, "
+                f"bound {bound[i].item():.3g} (torch {e_t[i].item():.3g})")
     return None
 
 

@@ -38,8 +38,8 @@ def test_result_must_overflow_where_the_reference_does():
     x = torch.tensor([[12.0, 1.0, -1.0, 0.5]], dtype=torch.float16)
     t, ref = torch.exp(x), torch.exp(x.double())
     garbage = torch.where(t.isinf(), t, 3.0).half()
-    assert compare(garbage, t, ref, "per_element") is not None
-    assert compare(t.clone(), t, ref, "per_element") is None
+    assert compare(garbage, t, ref, "relative") is not None
+    assert compare(t.clone(), t, ref, "relative") is None
 
 
 def test_comparison_must_match_torch_exactly():
@@ -69,4 +69,15 @@ def test_small_results_are_measured_against_themselves():
     t, ref = a * b, a.double() * b.double()
     y = torch.where(t.abs() < 1e-3, 0.0, t).bfloat16()
     assert compare(y, t, ref, "max_scaled") is None
-    assert compare(y, t, ref, "per_element") is not None
+    assert compare(y, t, ref, "relative") is not None
+
+
+def test_one_hard_element_does_not_loosen_the_bound_for_the_others():
+    # Where x is very negative, torch's float32 gelu and silu lose every digit (silu(-100)
+    # gives -0, not about -4e-42), so torch's error there is about 1/eps. Compared as
+    # maxima over the tensor, that let a result 2^-10 off on every element pass.
+    x = torch.randn(63, 1021, generator=torch.Generator().manual_seed(0)) * 100
+    for fn in (torch.nn.functional.gelu, torch.nn.functional.silu):
+        t, ref = fn(x), fn(x.double())
+        assert compare(t.clone(), t, ref, "relative") is None
+        assert compare(t * (1 + 2**-10), t, ref, "relative") is not None

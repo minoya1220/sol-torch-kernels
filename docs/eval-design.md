@@ -39,13 +39,13 @@ Every other op is measured against the float64 reference. Per element, with `eps
 s_i  = max(|r_i|, eps * max_j |r_j|, smallest normal of the dtype)    softmax
 s_i  = max(|r_i|, smallest normal of the dtype)                       elementwise
 e_i(x) = |x_i - r_i| / (eps * s_i)
-E(x) = max of e_i(x) over the elements where r_i, rounded to the output dtype, is finite
-pass: E(y) <= K * max(E(t), 1), with K = 4 for softmax and 2 for elementwise
+pass: e_i(y) <= K * max(e_i(t), 1) for every i where r_i, rounded to the output dtype, is finite,
+      with K = 4 for softmax and 2 for elementwise
 ```
 
 Why this rule and not a fixed `atol` and `rtol`:
 
-- The bound is relative to torch's own error on the same inputs, so it is tight where torch is accurate and loose only where the case is hard. There is no fixed number for an author to tune toward.
+- The bound is relative to torch's own error on the same element, so it is tight where torch is accurate and loose only where the element is hard. There is no fixed number for an author to tune toward. Comparing maxima over the tensor instead let one hard element loosen the bound for all: torch's float32 gelu and silu lose every digit for very negative inputs, and a result 2^-10 off on every element passed.
 - The floor of 1 (one ulp) lets a correctly rounded kernel pass where torch happens to be exact.
 - For softmax, the scale `s_i` gives relative error for large entries and absolute error, at the size of the largest entry, for entries far below it. Pure relative error is meaningless where the backward cancels to near zero. An elementwise output stands alone, so each element is measured against itself: under the softmax scale, zeroing every bf16 product below 1e-3 passed, and so would flushing subnormal results to zero.
 - The factor 4 allows a different summation order with float32 accumulation. It should reject accumulation in a 16-bit type. That is an expectation, not yet tested by an exploit. An elementwise op has no sum to reorder, so 2 leaves room only for a different implementation of the same function.

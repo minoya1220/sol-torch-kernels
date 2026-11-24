@@ -103,7 +103,7 @@ def elementwise(e: ElementwiseOp) -> Op:
     return Op(e.name, build, make_inputs, e.torch_fn, ref64,
               nbytes=lambda *xs: sum(x.nbytes for x in xs) + out_meta(*xs).nbytes,
               make_out=lambda *xs: torch.empty_like(out_meta(*xs), device=xs[0].device),
-              rule="exact" if e.exact else "per_element",
+              rule="exact" if e.exact else "relative",
               dev_cases=lambda: [c for c in elementwise_dev_cases(e.arity) if torch_accepts(c)],
               heldout_cases=lambda: [c for c in elementwise_heldout_cases(e.arity) if torch_accepts(c)],
               perf_cases=perf_cases)
