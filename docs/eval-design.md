@@ -74,7 +74,7 @@ Reported per perf case:
 - SoL: bandwidth divided by the peak, which is torch's `copy_` between two 1 GiB buffers, timed the same way on the same machine in the same run;
 - speedup over torch's own op, timed the same way.
 
-Perf shapes are the old repo's `BENCH_DIMS` at 2^29 bf16 elements.
+Perf shapes are the old repo's `BENCH_DIMS` at 2^27 bf16 elements (256 MiB per tensor) rather than its 2^29, so that the float64 reference of the backward fits on a 16 GB card. Each perf case is also checked once, eagerly, before it is timed.
 
 ### Checking the timed graph
 
