@@ -12,6 +12,8 @@ import json
 import sys
 from pathlib import Path
 
+from dataclasses import replace
+
 import torch
 
 from sol_eval.cases import Case, dev_cases, heldout_cases
@@ -49,7 +51,7 @@ def run_performance(op, build, case, peak_gbps) -> dict:
         return {"case": str(case), "passed": False, "failure": failure}
     g, copies = capture(fn, inputs, torch.empty_like(inputs[0]))
     us = time_graph(g)
-    failure = check_graph(op, g, copies)
+    failure = check_graph(op, g, copies, make_inputs(op, replace(case, seed=case.seed + 1)))
     if failure:
         return {"case": str(case), "passed": False, "failure": failure}
     torch_us = measure(op.torch_fn, inputs, torch.empty_like(inputs[0]))
