@@ -24,3 +24,7 @@ packages = ["src/sol_kernels", "src/sol_eval"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
+markers = [
+    "sm120: needs an sm120 GPU; skipped elsewhere and run in the external sm120 run (design 8.5)",
+]

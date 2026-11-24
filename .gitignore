@@ -16,3 +16,7 @@ reports/
 .env
 *.seed
 secrets/
+
+# CuTe DSL dumps
+*.cubin
+*.ptx
