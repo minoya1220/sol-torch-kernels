@@ -16,15 +16,9 @@ from dataclasses import replace
 
 import torch
 
-from sol_eval.cases import Case, dev_cases, heldout_cases
 from sol_eval.check import check, check_graph
 from sol_eval.measure import capture, measure, peak_bandwidth, time_graph
 from sol_eval.ops import OPS
-
-# 2^27 bf16 elements is 256 MiB per tensor, far above L2, while the float64
-# reference for the backward still fits on a 16 GB card
-PERF_ELEMENTS = 2**27
-PERF_ROW_LENGTHS = (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072)
 
 
 def make_inputs(op, case):
@@ -68,11 +62,10 @@ def main() -> int:
     args = parser.parse_args()
     op = OPS[args.op]
 
-    cases = heldout_cases() if args.heldout else dev_cases()
+    cases = op.heldout_cases() if args.heldout else op.dev_cases()
     correctness = run_correctness(op, op.build, cases)
     peak = peak_bandwidth()
-    perf_cases = [Case(PERF_ELEMENTS // n, n, torch.bfloat16) for n in PERF_ROW_LENGTHS]
-    performance = [run_performance(op, op.build, case, peak) for case in perf_cases]
+    performance = [run_performance(op, op.build, case, peak) for case in op.perf_cases]
 
     passed = sum(r["passed"] for r in correctness)
     print(f"{op.name} on {torch.cuda.get_device_name()}: {passed}/{len(correctness)} correctness cases pass")

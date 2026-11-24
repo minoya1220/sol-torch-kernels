@@ -5,15 +5,16 @@ compiling every op for every case takes too long for a test run. Needs a GPU."""
 import pytest
 import torch
 
-from sol_eval.cases import dev_cases
 from sol_eval.check import check
 from sol_eval.ops import OPS
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
+NAMES = ["softmax_fwd", "softmax_bwd", "add", "mul", "exp"]
 
-@pytest.mark.parametrize("case", dev_cases(), ids=str)
-@pytest.mark.parametrize("name", ["softmax_fwd", "softmax_bwd", "add", "mul", "exp"])
+
+@pytest.mark.parametrize("name,case", [(n, c) for n in NAMES for c in OPS[n].dev_cases()],
+                         ids=lambda x: str(x))
 def test_dev_case(name, case):
     op = OPS[name]
     inputs = op.make_inputs(case, torch.Generator("cuda").manual_seed(case.seed))

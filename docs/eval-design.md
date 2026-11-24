@@ -61,13 +61,15 @@ Dev cases are public and fixed. For both ops:
 
 Held-out cases come from the same public generator code, with random row counts, row lengths, dtypes, offsets and value kinds, drawn from a seed in the `SOL_HELDOUT_SEED` environment variable. The seed is never committed, since the repo is public. Fitting the generator's distribution is fine, because that is what correctness means. Learning the cases of one seed is not, which is why the seed stays out of the repo.
 
-Rows of length 1 and non-contiguous rows are not covered, because the softmax builders do not support them (open question 3).
+Elementwise ops get the softmax dev cases with every input contiguous, plus, on a 63 × 1021 shape and every dtype: each layout from `LAYOUTS` in `cases.py` (offset by one element, padded rows that each start at a new alignment, transposed, every other column, a row or column broadcast, a 0-dim float32 scalar) for one input at a time and for all inputs at once; some inputs of different dtypes; and edge values (`±inf`, `NaN`, `±0`). Held-out cases draw a layout and dtype for every input. Cases torch rejects, such as `lerp` with mixed dtypes, are dropped.
+
+Rows of length 1 and non-contiguous rows are not covered for softmax, because the softmax builders do not support them (open question 3).
 
 ## Performance
 
 Timing is `benchmark()` from `minoya1220/kernels`:
 
-- Copy the call's tensors until the copies total at least 1 GiB, or there are 100 copies, so the calls in one replay do not hit in L2. Very small cases still fit in L2 after 100 copies.
+- Copy the call's tensors, keeping each input's offset and strides, until the copies total at least 1 GiB, or there are 100 copies, so the calls in one replay do not hit in L2. Very small cases still fit in L2 after 100 copies.
 - Run 20 warmup calls on a side stream.
 - Capture 100 calls, cycling through the copies, in one CUDA graph, which removes launch overhead from the number.
 - Replay the graph 5 times, timed with CUDA events, and take the median replay time divided by 100.
@@ -79,7 +81,7 @@ Reported per perf case:
 - SoL: bandwidth divided by the peak, which is torch's `copy_` between two 1 GiB buffers, timed the same way on the same machine in the same run;
 - speedup over torch's own op, timed the same way.
 
-Perf shapes are the old repo's `BENCH_DIMS` at 2^27 bf16 elements (256 MiB per tensor) rather than its 2^29, so that the float64 reference of the backward fits on a 16 GB card. Each perf case is also checked once, eagerly, before it is timed.
+Elementwise ops are timed at 2^27 bf16 elements in three ways: contiguous, every input one element off alignment, and the second input a row broadcast. Softmax perf shapes are the old repo's `BENCH_DIMS` at 2^27 bf16 elements (256 MiB per tensor) rather than its 2^29, so that the float64 reference of the backward fits on a 16 GB card. Each perf case is also checked once, eagerly, before it is timed.
 
 ### Checking the timed graph
 

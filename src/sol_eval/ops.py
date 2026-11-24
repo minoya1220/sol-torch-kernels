@@ -1,13 +1,14 @@
 """The ops the harness can check and time. Each says how to make inputs for a case,
 how torch computes it in the kernel's call form, its float64 reference, the bytes it
-must move, how to allocate its output, and which error rule it is checked with."""
+must move, how to allocate its output, which error rule it is checked with, and its cases."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
 
-from sol_eval.cases import Case, make_tensor
+from sol_eval.cases import (Case, dev_cases, elementwise_dev_cases, elementwise_heldout_cases, heldout_cases,
+                            make_input, make_tensor)
 from sol_kernels.elementwise import elementwise_builder
 from sol_kernels.elementwise_ops import ELEMENTWISE_OPS, ElementwiseOp
 from sol_kernels.softmax_bwd import softmax_bwd_builder
@@ -24,6 +25,16 @@ class Op:
     nbytes: Callable       # (*inputs) -> bytes the op must read and write
     make_out: Callable     # (*inputs) -> an empty output for fn to write
     rule: str              # the error rule in sol_eval.check
+    dev_cases: Callable    # () -> correctness cases
+    heldout_cases: Callable
+    perf_cases: list       # cases to time
+
+
+# 2^27 bf16 elements is 256 MiB per tensor, far above L2, while the float64
+# reference for the softmax backward still fits on a 16 GB card
+PERF_ELEMENTS = 2**27
+SOFTMAX_PERF_CASES = [Case(PERF_ELEMENTS // n, n, torch.bfloat16)
+                      for n in (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072)]
 
 
 def fwd_inputs(case: Case, gen: torch.Generator):
@@ -56,12 +67,12 @@ def bwd_ref64(Y, dY):
 
 
 def elementwise(e: ElementwiseOp) -> Op:
-    """The harness op for an entry of sol_kernels.elementwise_ops. Every input is a tensor
-    of the case's shape, dtype, offset and kind of values; a bool input is one of them > 0.
-    torch, run on meta tensors, gives the output's shape, strides and promoted dtype."""
+    """The harness op for an entry of sol_kernels.elementwise_ops. Input i of a case comes
+    from cases.make_input; a bool input is that tensor > 0. torch, run on meta tensors,
+    gives the output's shape, strides and promoted dtype."""
 
     def make_inputs(case: Case, gen: torch.Generator):
-        xs = [make_tensor(case, gen) for _ in range(e.arity)]
+        xs = [make_input(case, i, gen) for i in range(e.arity)]
         return tuple(x > 0 if i in e.bool_inputs else x for i, x in enumerate(xs))
 
     def out_meta(*xs):
@@ -77,16 +88,33 @@ def elementwise(e: ElementwiseOp) -> Op:
     def ref64(*xs):
         return e.torch_fn(*(x.double() if x.is_floating_point() else x for x in xs))
 
+    def torch_accepts(case):  # torch.lerp, for one, rejects mixed dtypes
+        try:
+            out_meta(*make_inputs(replace(case, rows=2, cols=3), torch.Generator()))
+        except RuntimeError:
+            return False
+        return True
+
+    perf = Case(PERF_ELEMENTS // 4096, 4096, torch.bfloat16)
+    perf_cases = [perf, replace(perf, layouts=("offset",) * e.arity)]
+    if e.arity > 1:
+        perf_cases.append(replace(perf, layouts=("contiguous", "row", "contiguous")[:e.arity]))
+
     return Op(e.name, build, make_inputs, e.torch_fn, ref64,
               nbytes=lambda *xs: sum(x.nbytes for x in xs) + out_meta(*xs).nbytes,
               make_out=lambda *xs: torch.empty_like(out_meta(*xs), device=xs[0].device),
-              rule="exact" if e.exact else "per_element")
+              rule="exact" if e.exact else "per_element",
+              dev_cases=lambda: [c for c in elementwise_dev_cases(e.arity) if torch_accepts(c)],
+              heldout_cases=lambda: [c for c in elementwise_heldout_cases(e.arity) if torch_accepts(c)],
+              perf_cases=perf_cases)
 
 
 OPS = {
     "softmax_fwd": Op("softmax_fwd", softmax_fwd_builder, fwd_inputs, fwd_torch, fwd_ref64,
-                      nbytes=lambda X: 2 * X.nbytes, make_out=torch.empty_like, rule="max_scaled"),
+                      nbytes=lambda X: 2 * X.nbytes, make_out=torch.empty_like, rule="max_scaled",
+                      dev_cases=dev_cases, heldout_cases=heldout_cases, perf_cases=SOFTMAX_PERF_CASES),
     "softmax_bwd": Op("softmax_bwd", softmax_bwd_builder, bwd_inputs, bwd_torch, bwd_ref64,
                       nbytes=lambda Y, dY: 3 * Y.nbytes, make_out=lambda Y, dY: torch.empty_like(Y),
-                      rule="max_scaled"),
+                      rule="max_scaled", dev_cases=dev_cases, heldout_cases=heldout_cases,
+                      perf_cases=SOFTMAX_PERF_CASES),
 } | {e.name: elementwise(e) for e in ELEMENTWISE_OPS}
