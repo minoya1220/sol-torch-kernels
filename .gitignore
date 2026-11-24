@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# harness outputs
+runs/
+reports/
+*.nsys-rep
+*.sqlite
+
+# never commit verifier secrets or held-out seeds
+.env
+*.seed
+secrets/
