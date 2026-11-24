@@ -57,7 +57,7 @@ def bwd_ref64(Y, dY):
 def elementwise(e: ElementwiseOp) -> Op:
     """The harness op for an entry of sol_kernels.elementwise_ops. Every input is a tensor
     of the case's shape, dtype, offset and kind of values; a bool input is one of them > 0.
-    torch, run on meta tensors, gives the output's shape and promoted dtype."""
+    torch, run on meta tensors, gives the output's shape, strides and promoted dtype."""
 
     def make_inputs(case: Case, gen: torch.Generator):
         xs = [make_tensor(case, gen) for _ in range(e.arity)]
@@ -67,7 +67,11 @@ def elementwise(e: ElementwiseOp) -> Op:
         return e.torch_fn(*(x.to("meta") for x in xs))
 
     def build(*xs):
-        return elementwise_builder(e.f, *xs, out_dtype=out_meta(*xs).dtype)
+        out = out_meta(*xs)
+        # torch rounds every input to the common dtype before computing. That is the
+        # output dtype, except for a comparison, whose output is bool.
+        common = torch.result_type(*xs) if out.dtype == torch.bool else out.dtype
+        return elementwise_builder(e.f, *xs, out_like=out, common_dtype=common)
 
     def ref64(*xs):
         return e.torch_fn(*(x.double() if x.is_floating_point() else x for x in xs))
