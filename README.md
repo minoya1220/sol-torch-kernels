@@ -8,6 +8,7 @@ Status: the evaluation harness and the first op (softmax forward and backward) a
 
 - `src/sol_kernels/`: the kernels.
 - `src/sol_eval/`: the harness that checks and times them.
+- `eval/exploits/`: cheats the harness must reject, each with the defence that catches it.
 
 ## Setup
 

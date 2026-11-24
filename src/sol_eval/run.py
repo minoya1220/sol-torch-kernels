@@ -15,8 +15,8 @@ from pathlib import Path
 import torch
 
 from sol_eval.cases import Case, dev_cases, heldout_cases
-from sol_eval.check import check
-from sol_eval.measure import measure, peak_bandwidth
+from sol_eval.check import check, check_graph
+from sol_eval.measure import capture, measure, peak_bandwidth, time_graph
 from sol_eval.ops import OPS
 
 # 2^27 bf16 elements is 256 MiB per tensor, far above L2, while the float64
@@ -47,7 +47,11 @@ def run_performance(op, build, case, peak_gbps) -> dict:
     failure = check(op, fn, inputs)
     if failure:
         return {"case": str(case), "passed": False, "failure": failure}
-    us = measure(fn, inputs, torch.empty_like(inputs[0]))
+    g, copies = capture(fn, inputs, torch.empty_like(inputs[0]))
+    us = time_graph(g)
+    failure = check_graph(op, g, copies)
+    if failure:
+        return {"case": str(case), "passed": False, "failure": failure}
     torch_us = measure(op.torch_fn, inputs, torch.empty_like(inputs[0]))
     gbps = op.nbytes(*inputs) / us / 1e3
     return {"case": str(case), "passed": True, "failure": None, "us": us, "gbps": gbps,

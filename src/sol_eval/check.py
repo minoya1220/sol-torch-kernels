@@ -47,3 +47,17 @@ def check(op, fn, inputs) -> str | None:
     y = torch.empty_like(inputs[0])
     fn(*inputs, out=y)
     return compare(y, t, ref)
+
+
+def check_graph(op, g, copies) -> str | None:
+    """Poison every output copy with NaN, replay the timed graph once, and compare every output
+    copy. A call that did its work eagerly but not under the graph leaves NaN behind."""
+    for _, y in copies:
+        y.fill_(float("nan"))
+    g.replay()
+    t, ref = references(op, copies[0][0])
+    for _, y in copies:
+        failure = compare(y, t, ref)
+        if failure:
+            return f"after a graph replay: {failure}"
+    return None

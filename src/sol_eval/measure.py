@@ -16,9 +16,13 @@ def make_copies(inputs, out, iters):
     return [(tuple(t.clone() for t in inputs), out.clone()) for _ in range(n)]
 
 
-def measure(fn, inputs, out, *, warmup=20, iters=100, repeats=5) -> float:
-    """Median time of one call of fn(*inputs, out=out), in microseconds."""
-    copies = make_copies(inputs, out, iters)
+ITERS = 100  # calls per graph replay
+
+
+def capture(fn, inputs, out, *, warmup=20):
+    """Warm fn up, then capture ITERS calls of it in one CUDA graph, cycling through copies of
+    the call's tensors. Returns the graph and the copies it reads and writes."""
+    copies = make_copies(inputs, out, ITERS)
 
     # launching on a side stream is only needed if fn caches the stream it was first called on
     s = torch.cuda.Stream()
@@ -32,12 +36,16 @@ def measure(fn, inputs, out, *, warmup=20, iters=100, repeats=5) -> float:
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        for i in range(iters):
+        for i in range(ITERS):
             x, y = copies[i % len(copies)]
             fn(*x, out=y)
     g.replay()
     torch.cuda.synchronize()
+    return g, copies
 
+
+def time_graph(g, *, repeats=5) -> float:
+    """Median time of one call in the graph, in microseconds."""
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     times = []
@@ -46,8 +54,14 @@ def measure(fn, inputs, out, *, warmup=20, iters=100, repeats=5) -> float:
         g.replay()
         end.record()
         torch.cuda.synchronize()
-        times.append(start.elapsed_time(end) * 1000 / iters)
+        times.append(start.elapsed_time(end) * 1000 / ITERS)
     return median(times)
+
+
+def measure(fn, inputs, out) -> float:
+    """Median time of one call of fn(*inputs, out=out), in microseconds."""
+    g, _ = capture(fn, inputs, out)
+    return time_graph(g)
 
 
 def peak_bandwidth() -> float:
