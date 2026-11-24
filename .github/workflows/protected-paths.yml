@@ -1,0 +1,87 @@
+# Required check `protected-paths` (docs/eval-design.md 8.3).
+#
+# Runs on pull_request_target, so GitHub runs this file as it is on the base branch and
+# a PR cannot edit the check that judges it. The job never checks out or runs PR code:
+# it checks out the base commit (for the classifier and .github/protected-paths) and
+# reads the PR's file list and reviews from the API. PR-controlled strings (file names,
+# titles, branch names) never reach a shell command line; they go through JSON files.
+#
+# After approving, the owner re-runs this check from the Actions page. A
+# pull_request_review trigger is not used: that event runs the workflow file from the
+# PR's own ref, which the PR can edit.
+name: protected-paths
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: protected-paths-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  protected-paths:
+    name: protected-paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the base commit (never the PR)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Read the PR, its files and its reviews from the API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pr.json"
+          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" \
+            --jq '.[] | {filename, status, previous_filename}' > "$RUNNER_TEMP/files.ndjson"
+          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" \
+            --jq '.[] | {id, state, commit_id, submitted_at, login: .user.login}' > "$RUNNER_TEMP/reviews.ndjson"
+
+      - name: Classify paths and check the owner's approval
+        id: judge
+        env:
+          OWNER: ${{ github.repository_owner }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 src/sol_eval/integrity/paths.py judge \
+            --pr "$RUNNER_TEMP/pr.json" \
+            --files "$RUNNER_TEMP/files.ndjson" \
+            --reviews "$RUNNER_TEMP/reviews.ndjson" \
+            --owner "$OWNER" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --event-head-sha "$EVENT_HEAD_SHA" \
+            --protected-paths .github/protected-paths \
+            --out "$RUNNER_TEMP/decision.json" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Set the touches-protected label
+        if: always() && steps.judge.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$(jq -r .touches_protected "$RUNNER_TEMP/decision.json")" = "true" ]; then
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=touches-protected" > /dev/null \
+              || echo "::warning::could not add the touches-protected label"
+          else
+            gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/touches-protected" > /dev/null 2>&1 || true
+          fi
+
+      - name: Pass or fail
+        run: |
+          python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); sys.exit(0 if d["passed"] is True else 1)' \
+            "$RUNNER_TEMP/decision.json"

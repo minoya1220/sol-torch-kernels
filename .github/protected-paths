@@ -1,0 +1,13 @@
+.github/**
+docs/eval-design.md
+pyproject.toml
+uv.lock
+.python-version
+src/sol_kernels/_runtime/**
+src/sol_eval/**
+eval/**
+tests/**
+**/conftest.py
+**/sitecustomize.py
+**/usercustomize.py
+**/*.pth

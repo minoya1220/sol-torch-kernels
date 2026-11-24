@@ -1,0 +1,37 @@
+# CPU CI on every PR (docs/eval-design.md 8.3): lint and harness unit tests.
+# Normal pull_request trigger, read-only token, no secrets.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Static lint (placeholder)
+        run: echo "Placeholder. The static lint of impl files (design 2.2) lands in implementation step 4."
+
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - name: Install the locked environment
+        run: uv sync --frozen
+      - name: Harness unit tests (CPU)
+        run: uv run pytest -ra

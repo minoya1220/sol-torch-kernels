@@ -1,0 +1,15 @@
+# Every glob in .github/protected-paths, owned by the repository owner (docs/eval-design.md 8.3).
+# tests/test_protected_paths.py checks that this file and .github/protected-paths list the same globs.
+.github/** @minoya1220
+docs/eval-design.md @minoya1220
+pyproject.toml @minoya1220
+uv.lock @minoya1220
+.python-version @minoya1220
+src/sol_kernels/_runtime/** @minoya1220
+src/sol_eval/** @minoya1220
+eval/** @minoya1220
+tests/** @minoya1220
+**/conftest.py @minoya1220
+**/sitecustomize.py @minoya1220
+**/usercustomize.py @minoya1220
+**/*.pth @minoya1220
