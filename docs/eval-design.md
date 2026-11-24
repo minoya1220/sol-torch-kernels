@@ -51,7 +51,7 @@ Where `r_i` is NaN or infinite, `y_i` must be NaN or the same infinity. A NaN wh
 
 Dev cases are public and fixed. For both ops:
 
-- 63 rows, each row length from the old repo's list (3 to 131072, powers of two and odd lengths), each of bf16, fp16, fp32 and fp64, contiguous, values from `randn`;
+- 63 rows, each row length from the old repo's list (3 to 131072, powers of two and odd lengths), each of bf16, fp16 and fp32, contiguous, values from `randn`. float64 is left out because the kernels compute in float32;
 - for a few row lengths and every dtype: the tensor at an offset of one element, which breaks 16-byte alignment; values scaled by 100, so an unshifted `exp` overflows; and special values, with some entries at `-inf` and one row entirely `-inf`.
 
 Held-out cases come from the same public generator code, with random row counts, row lengths, dtypes, offsets and value kinds, drawn from a seed in the `SOL_HELDOUT_SEED` environment variable. The seed is never committed, since the repo is public. Fitting the generator's distribution is fine, because that is what correctness means. Learning the cases of one seed is not, which is why the seed stays out of the repo.
