@@ -1,1 +1,1 @@
-"""sol_eval: test and benchmark harness for sol_kernels. Protected path, see docs/eval-design.md."""
+"""sol_eval: checks and times sol_kernels. See docs/eval-design.md."""

@@ -1,0 +1,18 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    # No GPU here: the kernels are compiled for sm120 but not run.
+    runs-on: ubuntu-latest
+    env:
+      CUTE_DSL_ARCH: sm_120a
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+      - run: uv run pytest
