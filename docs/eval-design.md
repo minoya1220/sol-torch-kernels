@@ -15,6 +15,8 @@ fn(X, out=Y)                  # launches on the current stream and returns Y
 
 The builder compiles once; the returned function only launches. The harness builds once per case and then calls the function with tensors of the same shape, dtype and alignment. The torch baseline is written in the same form (`torch.ops.aten._softmax.out` and its backward), so the harness checks and times torch and the kernel with the same code.
 
+Elementwise ops share one builder, `elementwise_builder(f, *inputs, out_dtype=)`, where `f` is the op's function of float32 values. `sol_kernels/elementwise_ops.py` lists the ops as data: name, arity, `f` and the torch call to match, which also gives the output's shape and promoted dtype.
+
 The builder derives the vector width from the real pointer alignment of its tensors. The old builders passed `assumed_align=16` unconditionally, which is a false promise for a view at an odd offset.
 
 ## Correctness

@@ -43,7 +43,7 @@ def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor) -> str | None:
 
 def references(op, inputs) -> tuple[torch.Tensor, torch.Tensor]:
     """torch's result and the float64 reference for these inputs."""
-    t = torch.empty_like(inputs[0])
+    t = op.make_out(*inputs)
     op.torch_fn(*inputs, out=t)
     return t, op.ref64(*inputs)
 
@@ -51,7 +51,7 @@ def references(op, inputs) -> tuple[torch.Tensor, torch.Tensor]:
 def check(op, fn, inputs) -> str | None:
     """Run fn once on inputs and compare its output; None if it passes."""
     t, ref = references(op, inputs)
-    y = torch.empty_like(inputs[0])
+    y = op.make_out(*inputs)
     fn(*inputs, out=y)
     return compare(y, t, ref)
 

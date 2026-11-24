@@ -49,12 +49,12 @@ def run_performance(op, build, case, peak_gbps) -> dict:
     failure = check(op, fn, inputs)
     if failure:
         return {"case": str(case), "passed": False, "failure": failure}
-    g, copies = capture(fn, inputs, torch.empty_like(inputs[0]))
+    g, copies = capture(fn, inputs, op.make_out(*inputs))
     us = time_graph(g)
     failure = check_graph(op, g, copies, make_inputs(op, replace(case, seed=case.seed + 1)))
     if failure:
         return {"case": str(case), "passed": False, "failure": failure}
-    torch_us = measure(op.torch_fn, inputs, torch.empty_like(inputs[0]))
+    torch_us = measure(op.torch_fn, inputs, op.make_out(*inputs))
     gbps = op.nbytes(*inputs) / us / 1e3
     return {"case": str(case), "passed": True, "failure": None, "us": us, "gbps": gbps,
             "sol": gbps / peak_gbps, "torch_us": torch_us, "speedup": torch_us / us}
