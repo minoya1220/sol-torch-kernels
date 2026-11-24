@@ -1,6 +1,6 @@
 """The ops the harness can check and time. Each says how to make inputs for a case,
 how torch computes it in the kernel's call form, its float64 reference, the bytes it
-must move, and how to allocate its output."""
+must move, how to allocate its output, and which error rule it is checked with."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -23,6 +23,7 @@ class Op:
     ref64: Callable        # (*inputs) -> float64 result
     nbytes: Callable       # (*inputs) -> bytes the op must read and write
     make_out: Callable     # (*inputs) -> an empty output for fn to write
+    rule: str              # the error rule in sol_eval.check
 
 
 def fwd_inputs(case: Case, gen: torch.Generator):
@@ -78,12 +79,14 @@ def elementwise(e: ElementwiseOp) -> Op:
 
     return Op(e.name, build, make_inputs, e.torch_fn, ref64,
               nbytes=lambda *xs: sum(x.nbytes for x in xs) + out_meta(*xs).nbytes,
-              make_out=lambda *xs: torch.empty_like(out_meta(*xs), device=xs[0].device))
+              make_out=lambda *xs: torch.empty_like(out_meta(*xs), device=xs[0].device),
+              rule="exact" if e.exact else "per_element")
 
 
 OPS = {
     "softmax_fwd": Op("softmax_fwd", softmax_fwd_builder, fwd_inputs, fwd_torch, fwd_ref64,
-                      nbytes=lambda X: 2 * X.nbytes, make_out=torch.empty_like),
+                      nbytes=lambda X: 2 * X.nbytes, make_out=torch.empty_like, rule="max_scaled"),
     "softmax_bwd": Op("softmax_bwd", softmax_bwd_builder, bwd_inputs, bwd_torch, bwd_ref64,
-                      nbytes=lambda Y, dY: 3 * Y.nbytes, make_out=lambda Y, dY: torch.empty_like(Y)),
+                      nbytes=lambda Y, dY: 3 * Y.nbytes, make_out=lambda Y, dY: torch.empty_like(Y),
+                      rule="max_scaled"),
 } | {e.name: elementwise(e) for e in ELEMENTWISE_OPS}

@@ -1,31 +1,45 @@
-"""Correctness: a result passes if its error against the float64 reference is at most
-K times torch's own error on the same inputs. docs/eval-design.md says why."""
+"""Correctness: a result passes if it matches torch bit for bit (for ops that are one
+correctly rounded step), or if its error against the float64 reference is at most K times
+torch's own error on the same inputs. docs/eval-design.md says why."""
 
 import torch
 
-K = 4
+# K per error rule. "max_scaled" (softmax) measures small entries against the largest one;
+# "per_element" (elementwise ops) measures every entry against itself.
+K = {"max_scaled": 4, "per_element": 2}
 
 
-def error(x: torch.Tensor, ref: torch.Tensor) -> float:
+def error(x: torch.Tensor, ref: torch.Tensor, rule: str) -> float:
     """Largest error of x, in units of eps of x's dtype, over the elements where ref rounded
-    to x's dtype is finite. Small entries are measured against the largest entry, not
-    against themselves."""
+    to x's dtype is finite."""
     info = torch.finfo(x.dtype)
     finite = ref.to(x.dtype).isfinite()
     r = ref[finite]
     if r.numel() == 0:
         return 0.0
-    scale = r.abs().clamp_min(max(info.eps * r.abs().max().item(), info.tiny))
+    floor = info.tiny
+    if rule == "max_scaled":
+        floor = max(info.eps * r.abs().max().item(), info.tiny)
+    scale = r.abs().clamp_min(floor)
     return ((x.double()[finite] - r).abs() / (info.eps * scale)).max().item()
 
 
-def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor) -> str | None:
-    """None if y passes, else why it fails. t is torch's result on the same inputs."""
+def bits(x: torch.Tensor) -> torch.Tensor:
+    return x.view({1: torch.uint8, 2: torch.int16, 4: torch.int32}[x.element_size()])
+
+
+def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str) -> str | None:
+    """None if y passes under the op's rule, else why it fails. t is torch's result on the
+    same inputs."""
     if y.shape != t.shape or y.dtype != t.dtype:
         return f"got {tuple(y.shape)} {y.dtype}, torch gives {tuple(t.shape)} {t.dtype}"
-    if y.dtype == torch.bool:  # comparisons have exactly one right answer
-        wrong = (y != ref).sum().item()
-        return f"{wrong} of {y.numel()} elements differ from the reference" if wrong else None
+    if rule == "exact":
+        # NaN payloads are not compared: torch and the kernel may build NaN differently
+        same = bits(y) == bits(t)
+        if y.is_floating_point():
+            same |= y.isnan() & t.isnan()
+        wrong = (~same).sum().item()
+        return f"{wrong} of {y.numel()} elements differ from torch" if wrong else None
     # A reference too large for y's dtype rounds to inf, and y must be inf there too.
     # Measured as finite, it gave torch an infinite error and so an infinite bound.
     rounded = ref.to(y.dtype)
@@ -34,8 +48,8 @@ def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor) -> str | None:
     nan = rs.isnan()
     if not torch.equal(ys.isnan(), nan) or not torch.equal(ys[~nan], rs[~nan]):
         return "does not match the reference where it is NaN or inf"
-    e_y, e_t = error(y, ref), error(t, ref)
-    bound = K * max(e_t, 1.0)
+    e_y, e_t = error(y, ref, rule), error(t, ref, rule)
+    bound = K[rule] * max(e_t, 1.0)
     if not e_y <= bound:  # also fails when e_y is NaN
         return f"error {e_y:.3g} ulp, bound {bound:.3g} (torch {e_t:.3g})"
     return None
@@ -53,7 +67,7 @@ def check(op, fn, inputs) -> str | None:
     t, ref = references(op, inputs)
     y = op.make_out(*inputs)
     fn(*inputs, out=y)
-    return compare(y, t, ref)
+    return compare(y, t, ref, op.rule)
 
 
 def check_graph(op, g, copies, new_inputs) -> str | None:
@@ -68,7 +82,7 @@ def check_graph(op, g, copies, new_inputs) -> str | None:
     g.replay()
     t, ref = references(op, new_inputs)
     for _, y in copies:
-        failure = compare(y, t, ref)
+        failure = compare(y, t, ref, op.rule)
         if failure:
             return f"after a graph replay: {failure}"
     return None

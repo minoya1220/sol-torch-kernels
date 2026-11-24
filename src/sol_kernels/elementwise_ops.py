@@ -25,6 +25,8 @@ class ElementwiseOp:
     f: Callable
     torch_fn: Callable
     bool_inputs: tuple = ()  # positions of inputs that are torch.bool, like where's condition
+    # f takes the same correctly rounded float32 steps as torch, so its result must be torch's, bit for bit
+    exact: bool = False
 
 
 def select(cond, a, b):
@@ -63,40 +65,40 @@ def remainder(a, b):
 
 ELEMENTWISE_OPS = [
     # arithmetic
-    ElementwiseOp("neg", 1, lambda a: -a, torch.neg),
-    ElementwiseOp("abs", 1, lambda a: cute.math.abs(a), torch.abs),
-    ElementwiseOp("square", 1, lambda a: a * a, torch.square),
-    ElementwiseOp("reciprocal", 1, lambda a: 1.0 / a, torch.reciprocal),
-    ElementwiseOp("add", 2, lambda a, b: a + b, torch.add),
-    ElementwiseOp("sub", 2, lambda a, b: a - b, torch.sub),
-    ElementwiseOp("mul", 2, lambda a, b: a * b, torch.mul),
-    ElementwiseOp("div", 2, lambda a, b: a / b, torch.div),
-    ElementwiseOp("fmod", 2, lambda a, b: cute.math.rem(a, b), torch.fmod),
-    ElementwiseOp("remainder", 2, remainder, torch.remainder),
-    ElementwiseOp("maximum", 2, maximum, torch.maximum),
-    ElementwiseOp("minimum", 2, minimum, torch.minimum),
+    ElementwiseOp("neg", 1, lambda a: -a, torch.neg, exact=True),
+    ElementwiseOp("abs", 1, lambda a: cute.math.abs(a), torch.abs, exact=True),
+    ElementwiseOp("square", 1, lambda a: a * a, torch.square, exact=True),
+    ElementwiseOp("reciprocal", 1, lambda a: 1.0 / a, torch.reciprocal, exact=True),
+    ElementwiseOp("add", 2, lambda a, b: a + b, torch.add, exact=True),
+    ElementwiseOp("sub", 2, lambda a, b: a - b, torch.sub, exact=True),
+    ElementwiseOp("mul", 2, lambda a, b: a * b, torch.mul, exact=True),
+    ElementwiseOp("div", 2, lambda a, b: a / b, torch.div, exact=True),
+    ElementwiseOp("fmod", 2, lambda a, b: cute.math.rem(a, b), torch.fmod, exact=True),
+    ElementwiseOp("remainder", 2, remainder, torch.remainder, exact=True),
+    ElementwiseOp("maximum", 2, maximum, torch.maximum, exact=True),
+    ElementwiseOp("minimum", 2, minimum, torch.minimum, exact=True),
     ElementwiseOp("pow", 2, lambda a, b: cute.math.pow(a, b), torch.pow),
     ElementwiseOp("atan2", 2, lambda a, b: cute.math.atan2(a, b), torch.atan2),
     ElementwiseOp("addcmul", 3, lambda x, a, b: x + a * b, torch.addcmul),
     ElementwiseOp("addcdiv", 3, lambda x, a, b: x + a / b, torch.addcdiv),
     ElementwiseOp("lerp", 3, lerp, torch.lerp),
     # rounding
-    ElementwiseOp("floor", 1, lambda a: cute.math.floor(a), torch.floor),
-    ElementwiseOp("ceil", 1, lambda a: cute.math.ceil(a), torch.ceil),
-    ElementwiseOp("trunc", 1, lambda a: cute.math.trunc(a), torch.trunc),
-    ElementwiseOp("round", 1, lambda a: cute.math.roundeven(a), torch.round),
+    ElementwiseOp("floor", 1, lambda a: cute.math.floor(a), torch.floor, exact=True),
+    ElementwiseOp("ceil", 1, lambda a: cute.math.ceil(a), torch.ceil, exact=True),
+    ElementwiseOp("trunc", 1, lambda a: cute.math.trunc(a), torch.trunc, exact=True),
+    ElementwiseOp("round", 1, lambda a: cute.math.roundeven(a), torch.round, exact=True),
     # comparisons and selection
-    ElementwiseOp("eq", 2, lambda a, b: a == b, torch.eq),
-    ElementwiseOp("ne", 2, lambda a, b: a != b, torch.ne),
-    ElementwiseOp("lt", 2, lambda a, b: a < b, torch.lt),
-    ElementwiseOp("le", 2, lambda a, b: a <= b, torch.le),
-    ElementwiseOp("gt", 2, lambda a, b: a > b, torch.gt),
-    ElementwiseOp("ge", 2, lambda a, b: a >= b, torch.ge),
-    ElementwiseOp("where", 3, lambda c, a, b: select(c != 0.0, a, b), torch.where, bool_inputs=(0,)),
-    ElementwiseOp("clamp", 3, lambda x, lo, hi: minimum(maximum(x, lo), hi), torch.clamp),
+    ElementwiseOp("eq", 2, lambda a, b: a == b, torch.eq, exact=True),
+    ElementwiseOp("ne", 2, lambda a, b: a != b, torch.ne, exact=True),
+    ElementwiseOp("lt", 2, lambda a, b: a < b, torch.lt, exact=True),
+    ElementwiseOp("le", 2, lambda a, b: a <= b, torch.le, exact=True),
+    ElementwiseOp("gt", 2, lambda a, b: a > b, torch.gt, exact=True),
+    ElementwiseOp("ge", 2, lambda a, b: a >= b, torch.ge, exact=True),
+    ElementwiseOp("where", 3, lambda c, a, b: select(c != 0.0, a, b), torch.where, bool_inputs=(0,), exact=True),
+    ElementwiseOp("clamp", 3, lambda x, lo, hi: minimum(maximum(x, lo), hi), torch.clamp, exact=True),
     # activations
-    ElementwiseOp("relu", 1, lambda a: maximum(a, 0.0), aten.relu),
-    ElementwiseOp("leaky_relu", 1, lambda a: select(a > 0.0, a, a * 0.01), aten.leaky_relu),
+    ElementwiseOp("relu", 1, lambda a: maximum(a, 0.0), aten.relu, exact=True),
+    ElementwiseOp("leaky_relu", 1, lambda a: select(a > 0.0, a, a * 0.01), aten.leaky_relu, exact=True),
     ElementwiseOp("elu", 1, lambda a: select(a > 0.0, a, cute.math.expm1(a)), aten.elu),
     ElementwiseOp("sigmoid", 1, lambda a: 1.0 / (1.0 + cute.math.exp(-a)), torch.sigmoid),
     ElementwiseOp("silu", 1, lambda a: a / (1.0 + cute.math.exp(-a)), aten.silu),
@@ -114,7 +116,7 @@ ELEMENTWISE_OPS = [
     ElementwiseOp("log2", 1, lambda a: cute.math.log2(a), torch.log2),
     ElementwiseOp("log10", 1, lambda a: cute.math.log10(a), torch.log10),
     ElementwiseOp("log1p", 1, lambda a: cute.math.log1p(a), torch.log1p),
-    ElementwiseOp("sqrt", 1, lambda a: cute.math.sqrt(a), torch.sqrt),
+    ElementwiseOp("sqrt", 1, lambda a: cute.math.sqrt(a), torch.sqrt, exact=True),
     ElementwiseOp("rsqrt", 1, lambda a: cute.math.rsqrt(a), torch.rsqrt),
     ElementwiseOp("sin", 1, lambda a: cute.math.sin(a), torch.sin),
     ElementwiseOp("cos", 1, lambda a: cute.math.cos(a), torch.cos),
