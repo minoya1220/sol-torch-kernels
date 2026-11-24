@@ -154,6 +154,21 @@ def classify(path: str, protected_globs: tuple[str, ...]) -> str:
     return "other"
 
 
+def forbidden_files(paths: list[str], protected_globs: tuple[str, ...]) -> list[tuple[str, str]]:
+    """The `FORBIDDEN_FILE` part of the decision, for a PR's changed paths: an
+    auto-run file outside the harness, or an auto-run file anywhere in a PR that
+    touches kernel paths (H3). Returns (path, rule) pairs. Shared with the lint."""
+    classes = {p: classify(p, protected_globs) for p in paths}
+    kernel_pr = "kernel" in classes.values()
+    out: list[tuple[str, str]] = []
+    for p in paths:
+        if classes[p] == "forbidden":
+            out.append((p, "autorun_outside_harness"))
+        elif kernel_pr and is_autorun_name(p):
+            out.append((p, "autorun_in_kernel_pr"))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # decision
 
@@ -191,30 +206,28 @@ def decide(
 ) -> Decision:
     by_class: dict[str, list[str]] = {"forbidden": [], "protected": [], "kernel": [], "other": []}
     touches_protected = False
-    autorun_paths: list[str] = []
+    all_paths: list[str] = []
     for f in files:
         for p in (f.get("filename"), f.get("previous_filename")):
-            if not p:
+            if not p or p in all_paths:
                 continue
-            cls = classify(p, protected_globs)
-            if p not in by_class[cls]:
-                by_class[cls].append(p)
+            all_paths.append(p)
+            by_class[classify(p, protected_globs)].append(p)
             if matches_protected(p, protected_globs):
                 touches_protected = True
-            if is_autorun_name(p) and p not in autorun_paths:
-                autorun_paths.append(p)
 
     reasons: list[str] = []
     hard_fail = False
-    if by_class["forbidden"]:
+    bad = forbidden_files(all_paths, protected_globs)
+    outside = [p for p, rule in bad if rule == "autorun_outside_harness"]
+    in_kernel_pr = [p for p in all_paths if by_class["kernel"] and is_autorun_name(p)]
+    if outside:
+        hard_fail = True
+        reasons.append("FORBIDDEN_FILE: auto-executed file outside the harness: " + ", ".join(outside))
+    if in_kernel_pr:
         hard_fail = True
         reasons.append(
-            "FORBIDDEN_FILE: auto-executed file outside the harness: " + ", ".join(by_class["forbidden"])
-        )
-    if by_class["kernel"] and autorun_paths:
-        hard_fail = True
-        reasons.append(
-            "FORBIDDEN_FILE: auto-executed file in a PR that touches kernel paths: " + ", ".join(autorun_paths)
+            "FORBIDDEN_FILE: auto-executed file in a PR that touches kernel paths: " + ", ".join(in_kernel_pr)
         )
     if by_class["kernel"] and by_class["protected"]:
         hard_fail = True
