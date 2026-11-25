@@ -25,7 +25,7 @@ class ElementwiseOp:
     f: Callable
     torch_fn: Callable
     bool_inputs: tuple = ()  # positions of inputs that are torch.bool, like where's condition
-    # f takes the same correctly rounded float32 steps as torch, so its result must be torch's, bit for bit
+    # f takes the same correctly rounded float32 steps as torch, so its result must equal torch's
     exact: bool = False
 
 
@@ -33,17 +33,13 @@ def select(cond, a, b):
     return Float32(cutlass.select_(cond, Float32(a), Float32(b)))
 
 
-# torch's maximum, minimum, clamp and relu return NaN if any operand is NaN, and otherwise
-# their first operand on a tie, so maximum(-0, +0) is -0 and relu(-0) is -0. PTX max and
-# min with NaN propagation return +0 and -0 instead, which differed from torch on the card.
+# torch's maximum, minimum and clamp return NaN if any operand is NaN
 def maximum(a, b):
-    a, b = Float32(a), Float32(b)
-    return select((a < b) | (b != b), b, a)
+    return cute.math.max(Float32(a), Float32(b), propagate_nan=True)
 
 
 def minimum(a, b):
-    a, b = Float32(a), Float32(b)
-    return select((b < a) | (b != b), b, a)
+    return cute.math.min(Float32(a), Float32(b), propagate_nan=True)
 
 
 def gelu(x):

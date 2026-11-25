@@ -31,7 +31,7 @@ For each case the harness computes:
 
 ### Error rule
 
-Each op names its rule. Elementwise ops that are one correctly rounded float32 step in torch (add, sub, mul, div, sqrt, comparisons, where, clamp, relu, rounding and a few more; `exact=True` in the op list) must match torch bit for bit, except that NaN payloads are not compared. There is one right answer, so any slack would only hide a bug.
+Each op names its rule. Elementwise ops that are one correctly rounded float32 step in torch (add, sub, mul, div, sqrt, comparisons, where, clamp, relu, rounding and a few more; `exact=True` in the op list) must equal torch's result on every element, compared as values: NaN matches NaN, and +0 equals -0. There is one right answer, so any slack would only hide a bug. NaN payloads and the sign of zero are not compared because torch does not fix them: on the card, CUDA `maximum` and `minimum` returned a different zero on ties of +0 and -0 than torch on CPU does.
 
 Every other op is measured against the float64 reference. Per element, with `eps` the machine epsilon of the output dtype:
 

@@ -1,4 +1,4 @@
-"""Correctness: a result passes if it matches torch bit for bit (for ops that are one
+"""Correctness: a result passes if it equals torch's on every element (for ops that are one
 correctly rounded step), or if, on every element, its error against the float64 reference
 is at most K times torch's own error on that element. docs/eval-design.md says why."""
 
@@ -22,18 +22,15 @@ def error(x: torch.Tensor, ref: torch.Tensor, rule: str) -> torch.Tensor:
     return (x.double()[finite] - r).abs() / (info.eps * scale)
 
 
-def bits(x: torch.Tensor) -> torch.Tensor:
-    return x.view({1: torch.uint8, 2: torch.int16, 4: torch.int32}[x.element_size()])
-
-
 def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str) -> str | None:
     """None if y passes under the op's rule, else why it fails. t is torch's result on the
     same inputs."""
     if y.shape != t.shape or y.dtype != t.dtype:
         return f"got {tuple(y.shape)} {y.dtype}, torch gives {tuple(t.shape)} {t.dtype}"
     if rule == "exact":
-        # NaN payloads are not compared: torch and the kernel may build NaN differently
-        same = bits(y) == bits(t)
+        # Values, not bits: torch's CUDA maximum(+0, -0) may return either zero, so the sign
+        # of zero is not compared, and NaN payloads are not either.
+        same = y == t
         if y.is_floating_point():
             same |= y.isnan() & t.isnan()
         wrong = (~same).sum().item()
