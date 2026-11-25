@@ -28,6 +28,7 @@ class Op:
     dev_cases: Callable    # () -> correctness cases
     heldout_cases: Callable
     perf_cases: list       # cases to time
+    sum_size: Callable | None = None  # (*inputs) -> per element, the size of the terms of the sum it uses
 
 
 # 2^27 bf16 elements is 256 MiB per tensor, far above L2, while the float64
@@ -64,6 +65,12 @@ def bwd_torch(Y, dY, *, out):
 def bwd_ref64(Y, dY):
     Y, dY = Y.double(), dY.double()
     return Y * (dY - (Y * dY).sum(dim=-1, keepdim=True))
+
+
+def bwd_sum_size(Y, dY):
+    # dX_i = Y_i (dY_i - S): S's rounding error reaches dX_i times Y_i
+    Y, dY = Y.double(), dY.double()
+    return Y.abs() * (Y * dY).abs().sum(dim=-1, keepdim=True)
 
 
 def elementwise(e: ElementwiseOp) -> Op:
@@ -115,6 +122,6 @@ OPS = {
                       dev_cases=dev_cases, heldout_cases=heldout_cases, perf_cases=SOFTMAX_PERF_CASES),
     "softmax_bwd": Op("softmax_bwd", softmax_bwd_builder, bwd_inputs, bwd_torch, bwd_ref64,
                       nbytes=lambda Y, dY: 3 * Y.nbytes, make_out=lambda Y, dY: torch.empty_like(Y),
-                      rule="max_scaled", dev_cases=dev_cases, heldout_cases=heldout_cases,
-                      perf_cases=SOFTMAX_PERF_CASES),
+                      rule="sum_scaled", dev_cases=dev_cases, heldout_cases=heldout_cases,
+                      perf_cases=SOFTMAX_PERF_CASES, sum_size=bwd_sum_size),
 } | {e.name: elementwise(e) for e in ELEMENTWISE_OPS}

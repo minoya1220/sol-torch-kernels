@@ -36,7 +36,9 @@ Each op names its rule. Elementwise ops that are one correctly rounded float32 s
 Every other op is measured against the float64 reference. Per element, with `eps` the machine epsilon of the output dtype:
 
 ```
-s_i  = max(|r_i|, eps * max_j |r_j|, smallest normal of the dtype)    softmax
+s_i  = max(|r_i|, eps * max_j |r_j|, smallest normal of the dtype)    softmax forward
+s_i  = max(|r_i|, (eps_f32 / eps) * Y_i * A, smallest normal)         softmax backward,
+       with A = sum_j |Y_j dY_j| over the row
 s_i  = max(|r_i|, smallest normal of the dtype)                       elementwise
 e_i(x) = |x_i - r_i| / (eps * s_i)
 pass: e_i(y) <= K * max(e_i(t), 1) for every i where r_i, rounded to the output dtype, is finite,
@@ -47,8 +49,9 @@ Why this rule and not a fixed `atol` and `rtol`:
 
 - The bound is relative to torch's own error on the same element, so it is tight where torch is accurate and loose only where the element is hard. There is no fixed number for an author to tune toward. Comparing maxima over the tensor instead let one hard element loosen the bound for all: torch's float32 gelu and silu lose every digit for very negative inputs, and a result 2^-10 off on every element passed.
 - The floor of 1 (one ulp) lets a correctly rounded kernel pass where torch happens to be exact.
-- For softmax, the scale `s_i` gives relative error for large entries and absolute error, at the size of the largest entry, for entries far below it. Pure relative error is meaningless where the backward cancels to near zero. An elementwise output stands alone, so each element is measured against itself: under the softmax scale, zeroing every bf16 product below 1e-3 passed, and so would flushing subnormal results to zero.
-- The factor 4 allows a different summation order with float32 accumulation. It should reject accumulation in a 16-bit type. That is an expectation, not yet tested by an exploit. An elementwise op has no sum to reorder, so 2 leaves room only for a different implementation of the same function.
+- For softmax forward, the scale `s_i` gives relative error for large entries and absolute error, at the size of the largest entry, for entries far below it. An elementwise output stands alone, so each element is measured against itself: under the softmax scale, zeroing every bf16 product below 1e-3 passed, and so would flushing subnormal results to zero.
+- In the backward, dX_i = Y_i (dY_i - S) for the row sum S = sum_j Y_j dY_j. Where dY_i is close to S, dX_i is tiny and its error is Y_i times S's error. Torch's error there only says how close torch's sum landed on that row, so measured against |r_i| alone, a float32 sum as accurate as torch's but in another order failed 33 of 35 float32 cases on the card. A floating-point sum's error is a few eps times the sum of its terms' sizes, so the scale admits Y_i * A, in float32 units whatever the output dtype: S may carry a float32 sum's error and no more.
+- The factor 4 allows a different summation order with float32 accumulation and rejects accumulation in a 16-bit type. `tests/test_check.py` checks both for the backward. An elementwise op has no sum to reorder, so 2 leaves room only for a different implementation of the same function.
 
 Where `r_i`, rounded to the output dtype, is NaN or infinite, `y_i` must be NaN or the same infinity, so a result too large for the dtype must overflow. Measured as finite instead, such an element gave torch an infinite error and so an infinite bound. A NaN where the rounded `r_i` is finite makes `E` NaN, which fails.
 

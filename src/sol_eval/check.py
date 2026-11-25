@@ -4,25 +4,32 @@ is at most K times torch's own error on that element. docs/eval-design.md says w
 
 import torch
 
-# K per error rule. "max_scaled" (softmax) measures small entries against the largest one;
-# "relative" (elementwise ops) measures every entry against itself.
-K = {"max_scaled": 4, "relative": 2}
+# K per error rule. "max_scaled" (softmax forward) measures small entries against the largest
+# one; "relative" (elementwise ops) measures every entry against itself; "sum_scaled" (softmax
+# backward) measures every entry against the larger of itself and the size of the sum it uses.
+K = {"max_scaled": 4, "sum_scaled": 4, "relative": 2}
 
 
-def error(x: torch.Tensor, ref: torch.Tensor, rule: str) -> torch.Tensor:
+def error(x: torch.Tensor, ref: torch.Tensor, rule: str, sum_size: torch.Tensor | None = None) -> torch.Tensor:
     """Error of each element of x, in units of eps of x's dtype, over the elements where ref
-    rounded to x's dtype is finite."""
+    rounded to x's dtype is finite. For "sum_scaled", sum_size gives, per element, the size of
+    the summed terms its value depends on."""
     info = torch.finfo(x.dtype)
     finite = ref.to(x.dtype).isfinite()
     r = ref[finite]
     floor = info.tiny
     if rule == "max_scaled" and r.numel() > 0:
         floor = max(info.eps * r.abs().max().item(), info.tiny)
-    scale = r.abs().clamp_min(floor)
+    scale = r.abs()
+    if rule == "sum_scaled":
+        # the sum may carry a float32 sum's rounding error, whatever x's dtype
+        scale = torch.maximum(scale, torch.finfo(torch.float32).eps / info.eps * sum_size[finite])
+    scale = scale.clamp_min(floor)
     return (x.double()[finite] - r).abs() / (info.eps * scale)
 
 
-def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str) -> str | None:
+def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str,
+            sum_size: torch.Tensor | None = None) -> str | None:
     """None if y passes under the op's rule, else why it fails. t is torch's result on the
     same inputs."""
     if y.shape != t.shape or y.dtype != t.dtype:
@@ -45,7 +52,7 @@ def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str) -> s
         return "does not match the reference where it is NaN or inf"
     # Each element against torch's error on the same element: one element where torch's
     # formula underflows must not loosen the bound on all the others.
-    e_y, e_t = error(y, ref, rule), error(t, ref, rule)
+    e_y, e_t = error(y, ref, rule, sum_size), error(t, ref, rule, sum_size)
     bound = K[rule] * e_t.clamp_min(1.0)
     bad = ~(e_y <= bound)  # also catches NaN
     if bad.any():
@@ -55,19 +62,20 @@ def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str) -> s
     return None
 
 
-def references(op, inputs) -> tuple[torch.Tensor, torch.Tensor]:
-    """torch's result and the float64 reference for these inputs."""
+def references(op, inputs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """torch's result, the float64 reference and the op's sum sizes for these inputs."""
     t = op.make_out(*inputs)
     op.torch_fn(*inputs, out=t)
-    return t, op.ref64(*inputs)
+    sum_size = op.sum_size(*inputs) if op.sum_size else None
+    return t, op.ref64(*inputs), sum_size
 
 
 def check(op, fn, inputs) -> str | None:
     """Run fn once on inputs and compare its output; None if it passes."""
-    t, ref = references(op, inputs)
+    t, ref, sum_size = references(op, inputs)
     y = op.make_out(*inputs)
     fn(*inputs, out=y)
-    return compare(y, t, ref, op.rule)
+    return compare(y, t, ref, op.rule, sum_size)
 
 
 def check_graph(op, g, copies, new_inputs) -> str | None:
@@ -80,9 +88,9 @@ def check_graph(op, g, copies, new_inputs) -> str | None:
             a.copy_(b)
         y.fill_(float("nan"))
     g.replay()
-    t, ref = references(op, new_inputs)
+    t, ref, sum_size = references(op, new_inputs)
     for _, y in copies:
-        failure = compare(y, t, ref, op.rule)
+        failure = compare(y, t, ref, op.rule, sum_size)
         if failure:
             return f"after a graph replay: {failure}"
     return None

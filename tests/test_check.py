@@ -2,7 +2,9 @@
 
 import torch
 
+from sol_eval.cases import Case
 from sol_eval.check import compare
+from sol_eval.ops import OPS
 
 REF = torch.softmax(torch.randn(8, 100, generator=torch.Generator().manual_seed(0), dtype=torch.float64), dim=-1)
 
@@ -81,3 +83,40 @@ def test_one_hard_element_does_not_loosen_the_bound_for_the_others():
         t, ref = fn(x), fn(x.double())
         assert compare(t.clone(), t, ref, "relative") is None
         assert compare(t * (1 + 2**-10), t, ref, "relative") is not None
+
+
+def sequential_sum(x, dtype):
+    s = torch.zeros(x.shape[0], dtype=dtype)
+    for k in range(x.shape[1]):
+        s = (s.float() + x[:, k]).to(dtype)
+    return s.float()
+
+
+def backward_with_sum(Y, dY, dtype):
+    """Softmax backward with the row sum taken left to right and kept in dtype."""
+    S = sequential_sum(Y.float() * dY.float(), dtype)
+    return (Y.float() * (dY.float() - S[:, None])).to(Y.dtype)
+
+
+def backward_case(dtype):
+    op = OPS["softmax_bwd"]
+    Y, dY = op.make_inputs(Case(63, 1021, dtype), torch.Generator().manual_seed(0))
+    t = op.make_out(Y, dY)
+    op.torch_fn(Y, dY, out=t)
+    return Y, dY, t, op.ref64(Y, dY), op.sum_size(Y, dY)
+
+
+def test_a_float32_sum_in_another_order_passes_the_backward():
+    # Where dY_i is close to the row sum, dX_i carries the sum's error. Against torch's error on
+    # that element alone, a float32 sum in another order than torch's fails wherever torch's
+    # sum happened to land close; against the size of the summed terms, it passes.
+    Y, dY, t, ref, sum_size = backward_case(torch.float32)
+    y = backward_with_sum(Y, dY, torch.float32)
+    assert compare(y, t, ref, "max_scaled") is not None
+    assert compare(y, t, ref, "sum_scaled", sum_size) is None
+
+
+def test_a_16_bit_sum_fails_the_backward():
+    Y, dY, t, ref, sum_size = backward_case(torch.bfloat16)
+    assert compare(backward_with_sum(Y, dY, torch.float32), t, ref, "sum_scaled", sum_size) is None
+    assert compare(backward_with_sum(Y, dY, torch.bfloat16), t, ref, "sum_scaled", sum_size) is not None
