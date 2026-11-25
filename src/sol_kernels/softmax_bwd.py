@@ -11,7 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32
+from cutlass import Float32, Float64
 from cutlass.cute.runtime import from_dlpack
 
 from sol_kernels.cute_utils import pointer_alignment, warp_reduction_partial
@@ -31,6 +31,7 @@ def softmax_bwd_kernel(
     vec_size: cutlass.Constexpr,
     threads_per_row: cutlass.Constexpr,
     bdim: cutlass.Constexpr,
+    acc_type: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -41,7 +42,7 @@ def softmax_bwd_kernel(
     smem = cutlass.memory.SmemAllocator()
 
     buffer_layout = cute.make_layout(num_warps)
-    reduction_buffer = smem.allocate_tensor(cutlass.Float32, buffer_layout, byte_alignment=16)
+    reduction_buffer = smem.allocate_tensor(acc_type, buffer_layout, byte_alignment=16)
 
     # Divide global memory tensor into tiles
     blk_coord = (bidx, None)
@@ -83,10 +84,10 @@ def softmax_bwd_kernel(
     cute.copy(tiled_copy, tYgdY, tYrdY, pred=rPred)
 
     # Intra-thread reduction
-    accum = 0.0
+    accum = acc_type(0.0)
     for ni in cutlass.range_constexpr(0, n_iters):
         for i in cutlass.range_constexpr(0, vec_size):
-            accum += tYrY[(i, ni)].to(Float32) * tYrdY[(i, ni)].to(Float32)
+            accum += tYrY[(i, ni)].to(acc_type) * tYrdY[(i, ni)].to(acc_type)
 
     # Intra-warp reduction
     partial_sum = warp_reduction_partial(accum, operator.add, min(threads_per_row, 32))
@@ -101,7 +102,7 @@ def softmax_bwd_kernel(
         thr2buffer = cute.make_layout((warps_per_row, cute.arch.WARP_SIZE, num_warps // warps_per_row), stride=(1, 0, warps_per_row))
         partial_sum = reduction_buffer[thr2buffer(tidx)]
 
-    full_sum = warp_reduction_partial(partial_sum, operator.add, max(threads_per_row // 32, 1))
+    full_sum = warp_reduction_partial(partial_sum, operator.add, max(threads_per_row // 32, 1)).to(Float32)
 
     # Compute and store final result
     for ni in cutlass.range_constexpr(0, n_iters):
@@ -134,6 +135,12 @@ def softmax_bwd_builder(Y: torch.Tensor, dY: torch.Tensor) -> Callable:
     threads_per_row = min(bdim, 1 << (N // vec_size - 1).bit_length())
     rows_per_block = bdim // threads_per_row
 
+    # Every element where dY is close to sum(Y * dY) gets that sum's error, so a float32 sum,
+    # in any order other than torch's, is several times less accurate than torch's on some of
+    # those elements. Summed in float64 and rounded, the sum is as close as a float32 can be.
+    # A 16-bit output rounds away a float32 sum's error.
+    acc_type = Float64 if dtype == torch.float32 else Float32
+
     @cute.jit
     def softmax_bwd_launcher(mY: cute.Tensor, mdY: cute.Tensor, mdX: cute.Tensor, stream: cuda.CUstream = cuda.CUstream(0)):
         copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mY.element_type, num_bits_per_copy=bits_per_vec)
@@ -148,7 +155,7 @@ def softmax_bwd_builder(Y: torch.Tensor, dY: torch.Tensor) -> Callable:
 
         cY = cute.make_identity_tensor(mY.shape)
 
-        bwd_kernel = softmax_bwd_kernel(mY, mdY, mdX, cY, tv_layout, tiler, mY.shape, tiled_copy, n_iters, vec_size, threads_per_row, bdim)
+        bwd_kernel = softmax_bwd_kernel(mY, mdY, mdX, cY, tv_layout, tiler, mY.shape, tiled_copy, n_iters, vec_size, threads_per_row, bdim, acc_type)
 
         num_blocks = (M + rows_per_block - 1) // rows_per_block
         bwd_kernel.launch(grid=(num_blocks, 1, 1), block=(cute.size(tv_layout, mode=[0]), 1, 1), stream=stream)
