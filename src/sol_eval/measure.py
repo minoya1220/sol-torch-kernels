@@ -1,8 +1,10 @@
 """CUDA-graph timing, ported from benchmark() in minoya1220/kernels utils/measure.py.
 The harness always calls fn(*inputs, out=out), so the general argument handling is gone."""
 
+import threading
 from statistics import median
 
+import pynvml
 import torch
 
 L2_BUFFER_SIZE = 2**30  # 1 GiB is larger than L2 on any current GPU
@@ -51,38 +53,79 @@ def capture(fn, inputs, out, *, warmup=20):
     return g, copies
 
 
-def time_graph(g, *, repeats=5) -> float:
-    """Median time of one call in the graph, in microseconds."""
+class Clocks:
+    """Samples the SM and memory clocks through NVML on a thread while the block runs, as
+    MeasureMemoryClock does in minoya1220/kernels utils/measure.py, and keeps the medians in
+    MHz. A card's clock moves with its power and temperature, so a rate is only comparable
+    with a ceiling at the clock it ran at. Reading clocks needs no root; locking them with
+    nvidia-smi -lgc does, and when they are locked the samples show it. NVML gives each clock
+    averaged over its own sample period, 1/6 s to 1 s by product, so a timing should last a
+    second or more."""
+
+    def __init__(self, interval=0.01):
+        self.interval = interval
+
+    def sample(self):
+        while not self.stop.is_set():
+            self.samples.append((pynvml.nvmlDeviceGetClockInfo(self.handle, pynvml.NVML_CLOCK_SM),
+                                 pynvml.nvmlDeviceGetClockInfo(self.handle, pynvml.NVML_CLOCK_MEM)))
+            self.stop.wait(self.interval)
+
+    def __enter__(self):
+        pynvml.nvmlInit()
+        uuid = torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
+        self.handle = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{uuid}")
+        self.samples, self.stop = [], threading.Event()
+        self.thread = threading.Thread(target=self.sample, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.thread.join()
+        self.sm_mhz = median(sm for sm, _ in self.samples)
+        self.mem_mhz = median(mem for _, mem in self.samples)
+
+
+def time_graph(g, *, repeats=5) -> tuple[float, Clocks]:
+    """Median time of one call in the graph, in microseconds, and the clocks it ran at."""
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     times = []
-    for _ in range(repeats):
-        start.record()
-        g.replay()
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end) * 1000 / ITERS)
-    return median(times)
+    with Clocks() as clocks:
+        for _ in range(repeats):
+            start.record()
+            g.replay()
+            end.record()
+            torch.cuda.synchronize()
+            times.append(start.elapsed_time(end) * 1000 / ITERS)
+    return median(times), clocks
 
 
-def measure(fn, inputs, out) -> float:
-    """Median time of one call of fn(*inputs, out=out), in microseconds."""
+def measure(fn, inputs, out) -> tuple[float, Clocks]:
+    """Median time of one call of fn(*inputs, out=out), in microseconds, and its clocks."""
     g, _ = capture(fn, inputs, out)
     return time_graph(g)
 
 
-def peak_bandwidth() -> float:
+def peak_bandwidth() -> tuple[float, Clocks]:
     """GB/s of torch's copy_ between two 1 GiB buffers, timed the same way as a kernel."""
     src = torch.empty(2**30, dtype=torch.uint8, device="cuda")
-    us = measure(lambda x, *, out: out.copy_(x), (src,), torch.empty_like(src))
-    return 2 * src.nbytes / us / 1e3
+    us, clocks = measure(lambda x, *, out: out.copy_(x), (src,), torch.empty_like(src))
+    return 2 * src.nbytes / us / 1e3, clocks
 
 
-def peak_matmul() -> float:
-    """TFLOP/s of torch's bf16 matmul of two 8192 x 8192 matrices, timed the same way as a
-    kernel. cuBLAS accumulates in float32, as the attention kernel does: some cards run a
-    16-bit accumulator faster, and the kernel cannot use that rate."""
-    n = 8192
-    a, b = (torch.randn(n, n, device="cuda").bfloat16() for _ in range(2))
-    us = measure(lambda a, b, *, out: torch.matmul(a, b, out=out), (a, b), torch.empty_like(a))
-    return 2 * n**3 / us / 1e6
+def peak_flops_per_sm_clock() -> tuple[float, Clocks]:
+    """Tensor-core FLOPs per SM per SM clock of the bf16 mma.sync loop in sol_eval.mma_peak,
+    timed the same way as a kernel at the clock it ran at."""
+    from sol_eval.mma_peak import mma_loop
+    inputs, out, flops, fn = mma_loop()
+    us, clocks = measure(fn, inputs, out)
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return flops / (us * 1e-6) / (sms * clocks.sm_mhz * 1e6), clocks
+
+
+def ceiling_tflops(flops_per_sm_clock: float, sm_mhz: float) -> float:
+    """TFLOP/s the tensor cores can do at this SM clock."""
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return sms * flops_per_sm_clock * sm_mhz * 1e6 / 1e12

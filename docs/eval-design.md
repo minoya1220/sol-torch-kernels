@@ -91,10 +91,12 @@ Reported per perf case:
 - SoL: bandwidth divided by the peak, which is torch's `copy_` between two 1 GiB buffers, timed the same way on the same machine in the same run;
 - speedup over torch's own op, timed the same way.
 
+Clocks: while the timed replays run, a thread reads the SM and memory clocks through NVML every 10 ms, as `MeasureMemoryClock` does in `minoya1220/kernels`, and the report gives the medians for the kernel, for torch and for each peak. A card's clocks move with its power and temperature, so a speedup measured at two different clocks says less than it seems to. Reading the clocks needs no root and works in a container. Locking them (`sudo nvidia-smi -lgc <MHz>,<MHz>`, undone with `-rgc`) needs root on the host, so on a rented container the clocks are sampled but not locked; when they are locked, the samples show it.
+
 Attention is compute-bound, so its SoL is achieved FLOP/s against a FLOP/s peak:
 
 - FLOPs: 4 · batch · heads · D · the number of (query, key) pairs scored, which is Sq · Sk, or for causal the pairs with key ≤ query, about half. That is two matmuls, Q K^T and P V, at 2 FLOPs per multiply-add; the softmax is not counted;
-- peak: torch's bf16 `matmul` of two 8192 × 8192 matrices, timed the same way in the same run. cuBLAS accumulates in float32, as the kernel does. It is measured only when a compute-bound op runs;
+- ceiling: the SM count × the tensor cores' FLOPs per SM per clock × the SM clock the case ran at. The rate per clock is measured in the same run, when a compute-bound op runs, by a loop of the bf16 `mma.sync` the kernel uses, accumulating in float32 (`sol_eval/mma_peak.py`), timed the same way at its own sampled clock. No kernel issues that instruction faster, so a SoL above 1 means the harness is wrong. A fixed peak would not do: in the first run on the RTX 5060 Ti, cuBLAS's 8192³ bf16 matmul gave 45.1 TFLOP/s, attention ran at up to 47.9, and with no clock recorded there was no telling which clock either ran at;
 - perf shapes, bf16 unless noted, full and causal each: 4 × 16 heads × 4096² at D = 64 and at D = 128, 1 × 8 × 16384² at D = 128, 4 × 32 query heads on 8 key heads × 4096² at D = 128, and 4 × 16 × 4096² at D = 128 in fp16. Each does 0.14 to 1.1 TFLOP;
 - the report names the backend torch's dispatcher picks for each perf case (flash, efficient, cudnn or math), since the speedup is against that kernel.
 
@@ -106,7 +108,7 @@ A correct eager call says nothing about what the captured graph does. After timi
 
 ## Report
 
-`python -m sol_eval.run <op>` prints a table and writes JSON: device, torch and CuTe DSL versions, the peaks, then each correctness case (pass or fail, with the error) and each perf case (time, GB/s or TFLOP/s, SoL, torch time, speedup, and for attention torch's backend). `python -m sol_eval.run --all` does the same for every op in one process, with one peak measurement, and prints one line per op, the time spent compiling against the time spent checking and timing, and then every failure.
+`python -m sol_eval.run <op>` prints a table and writes JSON: device, torch and CuTe DSL versions, the peaks, then each correctness case (pass or fail, with the error) and each perf case (time, GB/s or TFLOP/s, SoL, the clocks it ran at, torch time and clocks, speedup, and for attention torch's backend). `python -m sol_eval.run --all` does the same for every op in one process, with one peak measurement, and prints one line per op, the time spent compiling against the time spent checking and timing, and then every failure.
 
 Compiling dominates a run. The elementwise kernel takes shapes and strides at run time, so one compile serves every case with the same dtypes, layout pattern and vector width, and `compile_kernel` keeps each compile in an `lru_cache`. Everything runs in one process, so a compile never runs while a kernel is timed. Softmax still compiles once per case, for its row length.
 
@@ -132,6 +134,7 @@ Compiling dominates a run. The elementwise kernel takes shapes and strides at ru
 | Patch the timer or the checker from an impl import (E6) | Tripwire on harness functions; external `nsys` timing | not yet |
 | Claim more bytes than the op moves (F1) | Bytes come from the harness, never from the impl | this round |
 | Time with data in L2 (F2) | 1 GiB of copies per replay; reject SoL above 1.02 | partly: copies only |
+| Compare a kernel with a ceiling measured at another clock | The ceiling is taken at the clock the kernel ran at, sampled through NVML | this round |
 | Slow the peak or the baseline (F3) | Measure them in a process that never loads impl code | not yet |
 | Tune only for the bench shapes, or keep stale tunings (G1 to G4) | Held-out perf shapes; kernel hash in tuning rows | not yet: no tuner |
 | Edit the harness, tests, CI or lockfile in a kernel PR (H1 to H3) | The owner reviews and merges every PR (`AGENTS.md` rule 8) | process |
@@ -142,7 +145,7 @@ Compiling dominates a run. The elementwise kernel takes shapes and strides at ru
 | Nondeterminism (J1) | Run twice and compare bitwise | not yet |
 | Non-contiguous, broadcast and aliased layouts (J3, J4) | Layout cases | not yet: softmax takes contiguous rows |
 
-Also deferred: a separate verifier process that holds the seed and judges outputs it did not produce, NVML clock and power monitoring, and CI on a GPU.
+Also deferred: a separate verifier process that holds the seed and judges outputs it did not produce, NVML power monitoring, and CI on a GPU.
 
 ## Open questions
 

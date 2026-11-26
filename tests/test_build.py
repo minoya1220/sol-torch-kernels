@@ -23,3 +23,8 @@ def test_attention_builds(head_dim, causal):
     case = AttentionCase(1, 4, 2, 100, 333, head_dim, torch.bfloat16, causal)
     inputs = op.make_inputs(case, torch.Generator().manual_seed(0))
     assert callable(op.build(*inputs, **op.options(case)))
+
+
+def test_mma_peak_loop_builds():
+    from sol_eval.mma_peak import compile_loop
+    assert compile_loop() is not None
