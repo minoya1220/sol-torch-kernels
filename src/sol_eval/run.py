@@ -48,7 +48,9 @@ def run_performance(op, build, case, peak_gbps) -> dict:
     failure = check_graph(op, g, copies, make_inputs(op, replace(case, seed=case.seed + 1)))
     if failure:
         return {"case": str(case), "passed": False, "failure": failure}
-    torch_us = measure(op.torch_fn, inputs, op.make_out(*inputs))
+    # torch is timed in its usual call, which allocates its own output: relu(x, out=) launches
+    # relu and then a copy into out. The outputs given to measure only size the L2 rotation.
+    torch_us = measure(lambda *xs, out: op.torch_call(*xs), inputs, op.make_out(*inputs))
     gbps = op.nbytes(*inputs) / us / 1e3
     return {"case": str(case), "passed": True, "failure": None, "us": us, "gbps": gbps,
             "sol": gbps / peak_gbps, "torch_us": torch_us, "speedup": torch_us / us}

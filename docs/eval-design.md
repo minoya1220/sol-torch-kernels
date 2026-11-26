@@ -13,7 +13,7 @@ fn = softmax_fwd_builder(X)   # compiles for X's shape, dtype and pointer alignm
 fn(X, out=Y)                  # launches on the current stream and returns Y
 ```
 
-The builder compiles once; the returned function only launches. The harness builds once per case and then calls the function with tensors of the same shape, dtype and alignment. The torch baseline is written in the same form (`torch.ops.aten._softmax.out` and its backward), so the harness checks and times torch and the kernel with the same code.
+The builder compiles once; the returned function only launches. The harness builds once per case and then calls the function with tensors of the same shape, dtype and alignment. The harness checks torch in the same form (`torch.ops.aten._softmax.out` and its backward), so torch and the kernel are checked with the same code. It times torch in its usual call (`torch.softmax(X, -1)`, `torch.relu(x)`), because some out= forms launch an extra copy: `relu(x, out=)` runs relu and then copies into out.
 
 Elementwise ops share one builder, `elementwise_builder(f, *inputs, out_like=, common_dtype=)`, where `f` is the op's function of float32 values. `sol_kernels/elementwise_ops.py` lists the ops as data: name, arity, `f` and the torch call to match. Run on meta tensors, the torch call gives the output's shape, strides and dtype (`out_like`), so the output is laid out as torch lays it out. The elementwise kernel is compiled per dtype, layout pattern and vector width, and takes shapes, strides and addresses at run time. It finds each row's alignment at run time and peels the unaligned head and tail of a row inside the same kernel.
 

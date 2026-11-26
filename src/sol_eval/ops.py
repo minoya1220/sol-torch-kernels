@@ -1,6 +1,7 @@
 """The ops the harness can check and time. Each says how to make inputs for a case,
-how torch computes it in the kernel's call form, its float64 reference, the bytes it
-must move, how to allocate its output, which error rule it is checked with, and its cases."""
+how torch computes it in the kernel's call form and in its usual call, its float64
+reference, the bytes it must move, how to allocate its output, which error rule it is
+checked with, and its cases."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -20,7 +21,8 @@ class Op:
     name: str
     build: Callable        # build(*inputs) -> fn, and fn(*inputs, out=) writes out
     make_inputs: Callable  # (case, generator) -> tuple of input tensors
-    torch_fn: Callable     # torch in the same call form as fn
+    torch_fn: Callable     # torch in the same call form as fn, for the checks
+    torch_call: Callable   # torch's usual call, without out=, which is what is timed
     ref64: Callable        # (*inputs) -> float64 result
     nbytes: Callable       # (*inputs) -> bytes the op must read and write
     make_out: Callable     # (*inputs) -> an empty output for fn to write
@@ -46,6 +48,10 @@ def fwd_torch(X, *, out):
     return torch.ops.aten._softmax.out(X, -1, False, out=out)
 
 
+def fwd_torch_call(X):
+    return torch.softmax(X, -1)
+
+
 def fwd_ref64(X):
     return torch.softmax(X.double(), dim=-1)
 
@@ -60,6 +66,10 @@ def bwd_inputs(case: Case, gen: torch.Generator):
 
 def bwd_torch(Y, dY, *, out):
     return torch.ops.aten._softmax_backward_data.out(dY, Y, -1, Y.dtype, grad_input=out)
+
+
+def bwd_torch_call(Y, dY):
+    return torch.ops.aten._softmax_backward_data(dY, Y, -1, Y.dtype)
 
 
 def bwd_ref64(Y, dY):
@@ -107,7 +117,7 @@ def elementwise(e: ElementwiseOp) -> Op:
     if e.arity > 1:
         perf_cases.append(replace(perf, layouts=("contiguous", "row", "contiguous")[:e.arity]))
 
-    return Op(e.name, build, make_inputs, e.torch_fn, ref64,
+    return Op(e.name, build, make_inputs, e.torch_fn, e.torch_fn, ref64,
               nbytes=lambda *xs: sum(x.nbytes for x in xs) + out_meta(*xs).nbytes,
               make_out=lambda *xs: torch.empty_like(out_meta(*xs), device=xs[0].device),
               rule="exact" if e.exact else "relative",
@@ -117,10 +127,10 @@ def elementwise(e: ElementwiseOp) -> Op:
 
 
 OPS = {
-    "softmax_fwd": Op("softmax_fwd", softmax_fwd_builder, fwd_inputs, fwd_torch, fwd_ref64,
+    "softmax_fwd": Op("softmax_fwd", softmax_fwd_builder, fwd_inputs, fwd_torch, fwd_torch_call, fwd_ref64,
                       nbytes=lambda X: 2 * X.nbytes, make_out=torch.empty_like, rule="max_scaled",
                       dev_cases=dev_cases, heldout_cases=heldout_cases, perf_cases=SOFTMAX_PERF_CASES),
-    "softmax_bwd": Op("softmax_bwd", softmax_bwd_builder, bwd_inputs, bwd_torch, bwd_ref64,
+    "softmax_bwd": Op("softmax_bwd", softmax_bwd_builder, bwd_inputs, bwd_torch, bwd_torch_call, bwd_ref64,
                       nbytes=lambda Y, dY: 3 * Y.nbytes, make_out=lambda Y, dY: torch.empty_like(Y),
                       rule="sum_scaled", dev_cases=dev_cases, heldout_cases=heldout_cases,
                       perf_cases=SOFTMAX_PERF_CASES, sum_size=bwd_sum_size),
