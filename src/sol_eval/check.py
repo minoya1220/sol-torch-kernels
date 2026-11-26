@@ -34,7 +34,8 @@ def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str,
     same inputs."""
     if y.shape != t.shape or y.dtype != t.dtype:
         return f"got {tuple(y.shape)} {y.dtype}, torch gives {tuple(t.shape)} {t.dtype}"
-    if rule == "exact":
+    if rule == "exact" or not y.is_floating_point():
+        # An integer or bool result has one right answer, whatever the op's rule.
         # Values, not bits: torch's CUDA maximum(+0, -0) may return either zero, so the sign
         # of zero is not compared, and NaN payloads are not either.
         same = y == t

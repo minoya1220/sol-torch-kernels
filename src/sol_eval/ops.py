@@ -97,22 +97,37 @@ def elementwise(e: ElementwiseOp) -> Op:
 
     def build(*xs):
         out = out_meta(*xs)
-        # torch rounds every input to the common dtype before computing. That is the
-        # output dtype, except for a comparison, whose output is bool.
-        common = torch.result_type(*xs) if out.dtype == torch.bool else out.dtype
+        # torch converts every input to the common dtype before computing. That is the
+        # output dtype, except for a comparison or a test, whose output is bool: there it is
+        # the dtype the inputs promote to, leaving out a condition like where's.
+        common = out.dtype
+        if out.dtype == torch.bool:
+            values = [x for i, x in enumerate(xs) if i not in e.bool_inputs]
+            common = values[0].dtype if len(values) == 1 else torch.result_type(*values)
         return elementwise_builder(e.f, *xs, out_like=out, common_dtype=common)
 
     def ref64(*xs):
-        return e.torch_fn(*(x.double() if x.is_floating_point() else x for x in xs))
+        # an integer or bool output is checked against torch exactly and needs no reference
+        if not out_meta(*xs).is_floating_point():
+            return e.torch_fn(*xs)
+        return e.torch_fn(*(x if x.dtype == torch.bool else x.double() for x in xs))
 
-    def torch_accepts(case):  # torch.lerp, for one, rejects mixed dtypes
+    def wanted(case):
+        """Whether the op is checked on this case: torch must accept the inputs' dtypes, which
+        the meta tensors do not check, so it runs on small CPU tensors."""
+        xs = make_inputs(replace(case, rows=2, cols=3), torch.Generator())
+        if not e.int_inputs and not all(x.is_floating_point() for i, x in enumerate(xs) if i not in e.bool_inputs):
+            return False
         try:
-            out_meta(*make_inputs(replace(case, rows=2, cols=3), torch.Generator()))
+            e.torch_fn(*xs)
         except RuntimeError:
             return False
         return True
 
+    # bf16, or int32 for an op torch only runs on integers
     perf = Case(PERF_ELEMENTS // 4096, 4096, torch.bfloat16)
+    if not wanted(perf):
+        perf = replace(perf, dtype=torch.int32)
     perf_cases = [perf, replace(perf, layouts=("offset",) * e.arity)]
     if e.arity > 1:
         perf_cases.append(replace(perf, layouts=("contiguous", "row", "contiguous")[:e.arity]))
@@ -121,8 +136,8 @@ def elementwise(e: ElementwiseOp) -> Op:
               nbytes=lambda *xs: sum(x.nbytes for x in xs) + out_meta(*xs).nbytes,
               make_out=lambda *xs: torch.empty_like(out_meta(*xs), device=xs[0].device),
               rule="exact" if e.exact else "relative",
-              dev_cases=lambda: [c for c in elementwise_dev_cases(e.arity) if torch_accepts(c)],
-              heldout_cases=lambda: [c for c in elementwise_heldout_cases(e.arity) if torch_accepts(c)],
+              dev_cases=lambda: [c for c in elementwise_dev_cases(e.arity) if wanted(c)],
+              heldout_cases=lambda: [c for c in elementwise_heldout_cases(e.arity) if wanted(c)],
               perf_cases=perf_cases)
 
 
