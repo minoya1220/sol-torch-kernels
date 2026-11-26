@@ -17,6 +17,8 @@ The builder compiles once; the returned function only launches. The harness buil
 
 Elementwise ops share one builder, `elementwise_builder(f, *inputs, out_like=, common_dtype=)`, where `f` is the op's function of float32 values. `sol_kernels/elementwise_ops.py` lists the ops as data: name, arity, `f` and the torch call to match. Run on meta tensors, the torch call gives the output's shape, strides and dtype (`out_like`), so the output is laid out as torch lays it out. The elementwise kernel is compiled per dtype, layout pattern and vector width, and takes shapes, strides and addresses at run time. It finds each row's alignment at run time and peels the unaligned head and tail of a row inside the same kernel.
 
+Attention forward matches `torch.nn.functional.scaled_dot_product_attention` with no mask other than causal and no dropout: `attention_fwd_builder(q, k, v, is_causal=, scale=)`, with `q` of shape (batch, heads, Sq, D) and `k`, `v` of (batch, kv_heads, Sk, D). `is_causal` and `scale` are not tensors, so an op can name such arguments per case (`Op.options`), and the harness passes them to the builder, to torch and to the reference. The kernel compiles per dtype, head dim and causal flag, and takes the shapes at run time. It can also write each row's log-sum-exp for the backward; `tests/test_attention_lse.py` checks that output against float64.
+
 The builder derives the vector width from the real pointer alignment of its tensors. The old builders passed `assumed_align=16` unconditionally, which is a false promise for a view at an odd offset.
 
 ## Correctness
@@ -40,9 +42,11 @@ s_i  = max(|r_i|, eps * max_j |r_j|, smallest normal of the dtype)    softmax fo
 s_i  = max(|r_i|, (eps_f32 / eps) * Y_i * A, smallest normal)         softmax backward,
        with A = sum_j |Y_j dY_j| over the row
 s_i  = max(|r_i|, smallest normal of the dtype)                       elementwise
+s_i  = max(|r_i|, sqrt(sum_j (P_ij V_jd)^2), smallest normal)         attention,
+       with P the float64 softmax probabilities
 e_i(x) = |x_i - r_i| / (eps * s_i)
 pass: e_i(y) <= K * max(e_i(t), 1) for every i where r_i, rounded to the output dtype, is finite,
-      with K = 4 for softmax and 2 for elementwise
+      with K = 4 for softmax and attention and 2 for elementwise
 ```
 
 Why this rule and not a fixed `atol` and `rtol`:
@@ -51,6 +55,7 @@ Why this rule and not a fixed `atol` and `rtol`:
 - The floor of 1 (one ulp) lets a correctly rounded kernel pass where torch happens to be exact.
 - For softmax forward, the scale `s_i` gives relative error for large entries and absolute error, at the size of the largest entry, for entries far below it. An elementwise output stands alone, so each element is measured against itself: under the softmax scale, zeroing every bf16 product below 1e-3 passed, and so would flushing subnormal results to zero.
 - In the backward, dX_i = Y_i (dY_i - S) for the row sum S = sum_j Y_j dY_j. Where dY_i is close to S, dX_i is tiny and its error is Y_i times S's error. Torch's error there only says how close torch's sum landed on that row, so measured against |r_i| alone, a float32 sum as accurate as torch's but in another order failed 33 of 35 float32 cases on the card. A floating-point sum's error is a few eps times the sum of its terms' sizes, so the scale admits Y_i * A, in float32 units whatever the output dtype: S may carry a float32 sum's error and no more.
+- In attention, O_id = sum_j P_ij V_jd, and a correct 16-bit kernel rounds every P_ij to the input dtype before the P V matmul, at points that depend on its block order. As in the backward, its error where O_id is near 0 is unrelated to torch's, and measured against |r_i| alone a correct flash kernel fails. The roundings are independent, so they add up like a random walk, to about eps times the root sum of squares of the terms, and the scale admits that much. The sum of the terms' sizes, the backward's scale, is about sqrt(Sk) times larger: under it a kernel that drops 8 of 4099 keys passes, while under the root sum of squares one that drops 1 fails, and so does a 16-bit accumulator for O over a long row. `tests/test_check.py` checks these on a CPU emulation of a flash kernel; its worst element sits near 1.1 against the bound of 4.
 - The factor 4 allows a different summation order with float32 accumulation and rejects accumulation in a 16-bit type. `tests/test_check.py` checks both for the backward. An elementwise op has no sum to reorder, so 2 leaves room only for a different implementation of the same function.
 
 Where `r_i`, rounded to the output dtype, is NaN or infinite, `y_i` must be NaN or the same infinity, so a result too large for the dtype must overflow. Measured as finite instead, such an element gave torch an infinite error and so an infinite bound. A NaN where the rounded `r_i` is finite makes `E` NaN, which fails.
@@ -65,6 +70,8 @@ Dev cases are public and fixed. For both ops:
 Held-out cases come from the same public generator code, with random row counts, row lengths, dtypes, offsets and value kinds, drawn from a seed in the `SOL_HELDOUT_SEED` environment variable. The seed is never committed, since the repo is public. Fitting the generator's distribution is fine, because that is what correctness means. Learning the cases of one seed is not, which is why the seed stays out of the repo.
 
 Elementwise ops get the softmax dev cases with every input contiguous, plus, on a 63 × 1021 shape and every dtype: each layout from `LAYOUTS` in `cases.py` (offset by one element, padded rows that each start at a new alignment, transposed, every other column, a row or column broadcast, a 0-dim float32 scalar) for one input at a time and for all inputs at once; some inputs of different dtypes; and edge values (`±inf`, `NaN`, `±0`). Held-out cases draw a layout and dtype for every input. Cases torch rejects, such as `lerp` with mixed dtypes, are dropped.
+
+Attention dev cases, for head dims 64 and 128, bf16 and fp16, causal and not: 2 × 4 heads with (Sq, Sk) of (128, 128), a multiple of every tile; (257, 257), off the tiles; (1, 1); (1, 1000); (1000, 1); (100, 333) and (333, 100), where Sq ≠ Sk; and (64, 8192), a long row of keys. At 257 × 257 also: grouped-query attention with 8 query heads on 2 key heads, a given scale of 0.3, and q times 30, so that exp of an unshifted score overflows. Held-out cases draw lengths up to 4096, heads, groups, dtype, head dim, causal, scale and values from the seed. The reference runs one head and block of rows at a time, so that P fits on the card.
 
 Rows of length 1 and non-contiguous rows are not covered for softmax, because the softmax builders do not support them (open question 3).
 
@@ -84,6 +91,13 @@ Reported per perf case:
 - SoL: bandwidth divided by the peak, which is torch's `copy_` between two 1 GiB buffers, timed the same way on the same machine in the same run;
 - speedup over torch's own op, timed the same way.
 
+Attention is compute-bound, so its SoL is achieved FLOP/s against a FLOP/s peak:
+
+- FLOPs: 4 · batch · heads · D · the number of (query, key) pairs scored, which is Sq · Sk, or for causal the pairs with key ≤ query, about half. That is two matmuls, Q K^T and P V, at 2 FLOPs per multiply-add; the softmax is not counted;
+- peak: torch's bf16 `matmul` of two 8192 × 8192 matrices, timed the same way in the same run. cuBLAS accumulates in float32, as the kernel does. It is measured only when a compute-bound op runs;
+- perf shapes, bf16 unless noted, full and causal each: 4 × 16 heads × 4096² at D = 64 and at D = 128, 1 × 8 × 16384² at D = 128, 4 × 32 query heads on 8 key heads × 4096² at D = 128, and 4 × 16 × 4096² at D = 128 in fp16. Each does 0.14 to 1.1 TFLOP;
+- the report names the backend torch's dispatcher picks for each perf case (flash, efficient, cudnn or math), since the speedup is against that kernel.
+
 Elementwise ops are timed at 2^27 bf16 elements in three ways: contiguous, every input one element off alignment, and the second input a row broadcast. Softmax perf shapes are the old repo's `BENCH_DIMS` at 2^27 bf16 elements (256 MiB per tensor) rather than its 2^29, so that the float64 reference of the backward fits on a 16 GB card. Each perf case is also checked once, eagerly, before it is timed.
 
 ### Checking the timed graph
@@ -92,7 +106,7 @@ A correct eager call says nothing about what the captured graph does. After timi
 
 ## Report
 
-`python -m sol_eval.run <op>` prints a table and writes JSON: device, torch and CuTe DSL versions, peak, then each correctness case (pass or fail, with the error) and each perf case (time, GB/s, SoL, torch time, speedup). `python -m sol_eval.run --all` does the same for every op in one process, with one peak measurement, and prints one line per op, the time spent compiling against the time spent checking and timing, and then every failure.
+`python -m sol_eval.run <op>` prints a table and writes JSON: device, torch and CuTe DSL versions, the peaks, then each correctness case (pass or fail, with the error) and each perf case (time, GB/s or TFLOP/s, SoL, torch time, speedup, and for attention torch's backend). `python -m sol_eval.run --all` does the same for every op in one process, with one peak measurement, and prints one line per op, the time spent compiling against the time spent checking and timing, and then every failure.
 
 Compiling dominates a run. The elementwise kernel takes shapes and strides at run time, so one compile serves every case with the same dtypes, layout pattern and vector width, and `compile_kernel` keeps each compile in an `lru_cache`. Everything runs in one process, so a compile never runs while a kernel is timed. Softmax still compiles once per case, for its row length.
 

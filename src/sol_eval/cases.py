@@ -1,7 +1,8 @@
 """Correctness cases. Both softmax ops take a 2-D row-major tensor, so a case is a
 shape, a dtype, an offset into the allocation, a kind of values and a seed for them.
 An elementwise op's inputs broadcast to the case's shape, and each can have its own layout
-and dtype."""
+and dtype. An attention case gives the shapes of q, k and v, a dtype, the causal flag and the
+scale, a kind of values and a seed."""
 
 import os
 import random
@@ -147,3 +148,74 @@ def make_tensor(case: Case, gen: torch.Generator) -> torch.Tensor:
         for i, v in enumerate((float("inf"), float("-inf"), float("nan"), 0.0, -0.0)):
             x[(u >= 0.01 * i) & (u < 0.01 * (i + 1))] = v
     return x
+
+
+@dataclass(frozen=True)
+class AttentionCase:
+    """q is (batch, heads, sq, head_dim); k and v are (batch, kv_heads, sk, head_dim)."""
+    batch: int
+    heads: int
+    kv_heads: int
+    sq: int
+    sk: int
+    head_dim: int
+    dtype: torch.dtype
+    causal: bool = False
+    scale: float | None = None  # None is torch's default, 1 / sqrt(head_dim)
+    values: str = "normal"      # "normal", or "wide": q times 30, so that exp of an unshifted score overflows
+    seed: int = 0
+
+    def __str__(self):
+        heads = f"{self.heads}/{self.kv_heads}" if self.kv_heads != self.heads else f"{self.heads}"
+        return (f"{self.batch}x{heads}x{self.sq}x{self.sk}x{self.head_dim}-{str(self.dtype).removeprefix('torch.')}"
+                f"-{'causal' if self.causal else 'full'}-scale{self.scale or 'default'}-{self.values}")
+
+
+# the kernels take 16-bit inputs and accumulate in float32
+ATTENTION_DTYPES = (torch.bfloat16, torch.float16)
+# (sq, sk): a multiple of every tile, lengths off the tiles, sq != sk both ways, length 1,
+# and a long row, where rounding error grows with the number of keys
+ATTENTION_LENGTHS = ((128, 128), (257, 257), (1, 1), (1, 1000), (1000, 1), (100, 333), (333, 100), (64, 8192))
+
+
+def attention_dev_cases() -> list[AttentionCase]:
+    cases = []
+    for d in (64, 128):
+        for dtype in ATTENTION_DTYPES:
+            for causal in (False, True):
+                for sq, sk in ATTENTION_LENGTHS:
+                    cases.append(AttentionCase(2, 4, 4, sq, sk, d, dtype, causal))
+                cases.append(AttentionCase(2, 8, 2, 257, 257, d, dtype, causal))  # grouped-query
+                cases.append(AttentionCase(2, 4, 4, 257, 257, d, dtype, causal, scale=0.3))
+                cases.append(AttentionCase(2, 4, 4, 257, 257, d, dtype, causal, values="wide"))
+    return cases
+
+
+def attention_heldout_cases(count: int = 100) -> list[AttentionCase]:
+    """attention_dev_cases' kinds of case, with random lengths, from the held-out seed."""
+    seed = os.environ.get("SOL_HELDOUT_SEED")
+    if not seed:
+        raise RuntimeError("set SOL_HELDOUT_SEED to run the held-out cases")
+    rng = random.Random(seed + "-attention")
+    cases = []
+    for _ in range(count):
+        kv_heads = rng.choice((1, 2, 4))
+        heads = kv_heads * rng.choice((1, 1, 2, 4))
+        sq, sk = (max(1, round(2 ** rng.uniform(0, 12))) for _ in range(2))
+        scale = rng.choice((None, None, rng.uniform(0.02, 1.0)))
+        cases.append(AttentionCase(rng.randint(1, 3), heads, kv_heads, sq, sk, rng.choice((64, 128)),
+                                   rng.choice(ATTENTION_DTYPES), rng.choice((False, True)), scale,
+                                   rng.choice(("normal", "normal", "wide")), seed=rng.getrandbits(63)))
+    return cases
+
+
+def make_attention_inputs(case: AttentionCase, gen: torch.Generator) -> tuple[torch.Tensor, ...]:
+    """q, k and v for the case, on the generator's device. Callers seed gen with case.seed."""
+    def randn(heads, seq):
+        shape = (case.batch, heads, seq, case.head_dim)
+        return torch.randn(shape, generator=gen, device=gen.device).to(case.dtype)
+
+    q, k, v = randn(case.heads, case.sq), randn(case.kv_heads, case.sk), randn(case.kv_heads, case.sk)
+    if case.values == "wide":
+        q.mul_(30)
+    return q, k, v
