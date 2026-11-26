@@ -34,7 +34,8 @@ def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str,
     same inputs."""
     if y.shape != t.shape or y.dtype != t.dtype:
         return f"got {tuple(y.shape)} {y.dtype}, torch gives {tuple(t.shape)} {t.dtype}"
-    if rule == "exact":
+    if rule == "exact" or not y.is_floating_point():
+        # An integer or bool result has one right answer, whatever the op's rule.
         # Values, not bits: torch's CUDA maximum(+0, -0) may return either zero, so the sign
         # of zero is not compared, and NaN payloads are not either.
         same = y == t
@@ -79,16 +80,21 @@ def check(op, fn, inputs) -> str | None:
 
 
 def check_graph(op, g, copies, new_inputs) -> str | None:
-    """Give every input copy new values at the same addresses, poison every output copy with
-    NaN, replay the timed graph once, and compare every output copy. A call that did its work
-    eagerly but not under the graph leaves NaN behind; one that returns a result cached from
-    earlier inputs returns the wrong values."""
+    """Give every input copy new values at the same addresses, poison every output copy,
+    replay the timed graph once, and compare every output copy. A call that did its work
+    eagerly but not under the graph leaves the poison behind; one that returns a result cached
+    from earlier inputs returns the wrong values. The poison is NaN for a float output, and
+    for an integer or bool one, which holds no NaN, the complement of torch's result, so that
+    every element starts wrong."""
+    t, ref, sum_size = references(op, new_inputs)
     for x, y in copies:
         for a, b in zip(x, new_inputs):
             a.copy_(b)
-        y.fill_(float("nan"))
+        if y.is_floating_point():
+            y.fill_(float("nan"))
+        else:
+            y.copy_(~t)
     g.replay()
-    t, ref, sum_size = references(op, new_inputs)
     for _, y in copies:
         failure = compare(y, t, ref, op.rule, sum_size)
         if failure:

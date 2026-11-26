@@ -9,8 +9,10 @@ from dataclasses import dataclass, replace
 
 import torch
 
-# float64 is left out: the kernels compute in float32 (see the softmax builders)
+# float64 is left out: the softmax kernels compute in float32 (see the softmax builders)
 DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+# dtypes that only elementwise ops take
+EXTRA_DTYPES = (torch.float64, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64, torch.bool)
 DEV_ROW_LENGTHS = (3, 7, 8, 17, 64, 100, 257, 511, 633, 1021, 2049, 4099,
                    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072)
 EXTRA_ROW_LENGTHS = (7, 1021, 4099, 65536)
@@ -23,11 +25,14 @@ LAYOUTS = (
     "strided",     # every other column
     "row",         # shape (cols,), broadcast across the rows
     "column",      # shape (rows, 1), broadcast along each row
-    "scalar",      # a 0-dim float32 tensor
+    "scalar",      # a 0-dim tensor: float32 for a float case, int64 for an integer one, else bool
 )
-# input dtypes for cases that mix them: bf16 with fp16 computes in fp32
+# input dtypes for cases that mix them: bf16 with fp16 computes in fp32, uint8 with int8 in
+# int16, and an integer or bool with a float in the float
 MIXED_DTYPES = ((torch.bfloat16, torch.float16), (torch.float16, torch.bfloat16),
-                (torch.bfloat16, torch.float32), (torch.float32, torch.float16))
+                (torch.bfloat16, torch.float32), (torch.float32, torch.float16),
+                (torch.float64, torch.float16), (torch.uint8, torch.int8), (torch.int32, torch.bfloat16),
+                (torch.int64, torch.float32), (torch.bool, torch.float16))
 
 
 @dataclass(frozen=True)
@@ -79,10 +84,14 @@ def heldout_cases(count: int = 100) -> list[Case]:
 
 
 def elementwise_dev_cases(arity: int) -> list[Case]:
-    """The softmax dev cases, with every input contiguous, plus each layout and some mixed
-    dtypes on one odd shape."""
+    """The softmax dev cases, with every input contiguous, and the same on fewer row lengths
+    for the dtypes only elementwise ops take; then, for every dtype, each layout and edge
+    values on one odd shape; then some mixed dtypes."""
     cases = dev_cases()
-    for d in DTYPES:
+    for d in EXTRA_DTYPES:
+        cases += [Case(63, n, d) for n in EXTRA_ROW_LENGTHS]
+        cases += [Case(63, 1021, d, offset=1), Case(63, 1021, d, values="wide")]
+    for d in DTYPES + EXTRA_DTYPES:
         cases.append(Case(63, 1021, d, values="edge"))
         for layout in LAYOUTS[1:]:
             for i in range(arity):  # this input in the layout, the others contiguous
@@ -96,14 +105,17 @@ def elementwise_dev_cases(arity: int) -> list[Case]:
 
 
 def elementwise_heldout_cases(arity: int, count: int = 100) -> list[Case]:
-    """heldout_cases, with a layout and a dtype drawn for every input."""
+    """heldout_cases, with a layout and a dtype drawn for every input. Four in ten cases
+    take a dtype only elementwise ops take, and each input keeps the case's dtype two
+    times in three."""
     rng = random.Random(os.environ.get("SOL_HELDOUT_SEED", "") + f"-elementwise-{arity}")
     cases = []
     for case in heldout_cases(count):
+        dtype = case.dtype if rng.random() < 0.6 else rng.choice(EXTRA_DTYPES)
         layouts = tuple(rng.choice(LAYOUTS[:1] * 3 + LAYOUTS[1:]) for _ in range(arity))
-        dtypes = tuple(rng.choice((case.dtype,) * 3 + DTYPES) for _ in range(arity))
+        dtypes = tuple(dtype if rng.random() < 2 / 3 else rng.choice(DTYPES + EXTRA_DTYPES) for _ in range(arity))
         values = rng.choice((case.values, "edge"))
-        cases.append(replace(case, values=values, layouts=layouts, dtypes=dtypes))
+        cases.append(replace(case, dtype=dtype, values=values, layouts=layouts, dtypes=dtypes))
     return cases
 
 
@@ -128,13 +140,22 @@ def make_input(case: Case, i: int, gen: torch.Generator) -> torch.Tensor:
     if layout == "column":
         return make_tensor(replace(c, cols=1), gen)
     if layout == "scalar":
-        return make_tensor(replace(c, rows=1, cols=1, dtype=torch.float32), gen)[0, 0]
+        if c.dtype.is_floating_point:
+            scalar_dtype = torch.float32
+        else:
+            scalar_dtype = torch.bool if c.dtype == torch.bool else torch.int64
+        return make_tensor(replace(c, rows=1, cols=1, dtype=scalar_dtype), gen)[0, 0]
     raise ValueError(layout)
 
 
 def make_tensor(case: Case, gen: torch.Generator) -> torch.Tensor:
     """A tensor for the case, on the generator's device. Callers seed gen with case.seed."""
     n = case.rows * case.cols
+    if case.dtype == torch.bool:
+        base = torch.randn(case.offset + n, generator=gen, device=gen.device) > 0
+        return base[case.offset:].view(case.rows, case.cols)
+    if not case.dtype.is_floating_point:
+        return make_integers(case, gen)[case.offset:].view(case.rows, case.cols)
     base = torch.randn(case.offset + n, generator=gen, device=gen.device).to(case.dtype)
     x = base[case.offset:].view(case.rows, case.cols)
     if case.values == "wide":
@@ -145,5 +166,22 @@ def make_tensor(case: Case, gen: torch.Generator) -> torch.Tensor:
     elif case.values == "edge":  # for elementwise ops: values each op must pass through as torch does
         u = torch.rand(x.shape, generator=gen, device=gen.device)
         for i, v in enumerate((float("inf"), float("-inf"), float("nan"), 0.0, -0.0)):
+            x[(u >= 0.01 * i) & (u < 0.01 * (i + 1))] = v
+    return x
+
+
+def make_integers(case: Case, gen: torch.Generator) -> torch.Tensor:
+    """The case's allocation of integers: for "wide" values, any value of the dtype; else
+    values from -70 to 70 (wrapped into uint8), which as shift amounts are in range and out
+    of it. "edge" and "special" mix in the dtype's limits, 0, 1 and -1."""
+    size = case.offset + case.rows * case.cols
+    info = torch.iinfo(case.dtype)
+    if case.values == "wide":
+        return torch.randint(info.min, info.max, (size,), generator=gen, device=gen.device, dtype=case.dtype)
+    x = torch.randint(-70, 71, (size,), generator=gen, device=gen.device).to(case.dtype)
+    if case.values in ("edge", "special"):
+        u = torch.rand(size, generator=gen, device=gen.device)
+        edges = [v for v in (info.min, info.max, 0, 1, -1) if v >= info.min]
+        for i, v in enumerate(edges):
             x[(u >= 0.01 * i) & (u < 0.01 * (i + 1))] = v
     return x

@@ -15,7 +15,7 @@ fn(X, out=Y)                  # launches on the current stream and returns Y
 
 The builder compiles once; the returned function only launches. The harness builds once per case and then calls the function with tensors of the same shape, dtype and alignment. The harness checks torch in the same form (`torch.ops.aten._softmax.out` and its backward), so torch and the kernel are checked with the same code. It times torch in its usual call (`torch.softmax(X, -1)`, `torch.relu(x)`), because some out= forms launch an extra copy: `relu(x, out=)` runs relu and then copies into out.
 
-Elementwise ops share one builder, `elementwise_builder(f, *inputs, out_like=, common_dtype=)`, where `f` is the op's function of float32 values. `sol_kernels/elementwise_ops.py` lists the ops as data: name, arity, `f` and the torch call to match. Run on meta tensors, the torch call gives the output's shape, strides and dtype (`out_like`), so the output is laid out as torch lays it out. The elementwise kernel is compiled per dtype, layout pattern and vector width, and takes shapes, strides and addresses at run time. It finds each row's alignment at run time and peels the unaligned head and tail of a row inside the same kernel.
+Elementwise ops share one builder, `elementwise_builder(f, *inputs, out_like=, common_dtype=)`. `sol_kernels/elementwise_ops.py` lists the ops as data: name, arity, `f` and the torch call to match. The kernel converts each input to the common dtype, as torch does, then to the compute type: float32 for bf16 and fp16, and the common dtype itself for float32, float64, the integer types and bool. `f` takes and returns compute-type values, and the result is converted to the output dtype. Conversions follow torch's `static_cast_with_inter_type`: a float goes to uint8 through int64, an integer or float64 goes to bf16 or fp16 through float32, and any value goes to bool as `x != 0`. A float outside an integer type's range has no defined conversion in C++, and the card decides whether the kernel matches torch there. Run on meta tensors, the torch call gives the output's shape, strides and dtype (`out_like`), so the output is laid out as torch lays it out. The elementwise kernel is compiled per dtype, layout pattern and vector width, and takes shapes, strides and addresses at run time. It finds each row's alignment at run time and peels the unaligned head and tail of a row inside the same kernel.
 
 The builder derives the vector width from the real pointer alignment of its tensors. The old builders passed `assumed_align=16` unconditionally, which is a false promise for a view at an odd offset.
 
@@ -31,7 +31,7 @@ For each case the harness computes:
 
 ### Error rule
 
-Each op names its rule. Elementwise ops that are one correctly rounded float32 step in torch (add, sub, mul, div, sqrt, comparisons, where, clamp, relu, rounding and a few more; `exact=True` in the op list) must equal torch's result on every element, compared as values: NaN matches NaN, and +0 equals -0. There is one right answer, so any slack would only hide a bug. NaN payloads and the sign of zero are not compared because torch does not fix them: on the card, CUDA `maximum` and `minimum` returned a different zero on ties of +0 and -0 than torch on CPU does.
+Each op names its rule. Elementwise ops that are one correctly rounded step in torch (add, sub, mul, div, sqrt, comparisons, where, clamp, relu, rounding, casts, bitwise ops, the piecewise-linear backward ops and a few more; `exact=True` in the op list) must equal torch's result on every element, compared as values: NaN matches NaN, and +0 equals -0. There is one right answer, so any slack would only hide a bug. NaN payloads and the sign of zero are not compared because torch does not fix them: on the card, CUDA `maximum` and `minimum` returned a different zero on ties of +0 and -0 than torch on CPU does. An integer or bool result is compared the same way whatever the op's rule, because it has one right answer.
 
 Every other op is measured against the float64 reference. Per element, with `eps` the machine epsilon of the output dtype:
 
@@ -44,6 +44,8 @@ e_i(x) = |x_i - r_i| / (eps * s_i)
 pass: e_i(y) <= K * max(e_i(t), 1) for every i where r_i, rounded to the output dtype, is finite,
       with K = 4 for softmax and 2 for elementwise
 ```
+
+For a float64 output the reference is torch's own float64 result, since there is nothing more precise to compare with. Then `e_i(t) = 0`, and the rule allows 2 ulp of float64 from torch's result.
 
 Why this rule and not a fixed `atol` and `rtol`:
 
@@ -64,7 +66,7 @@ Dev cases are public and fixed. For both ops:
 
 Held-out cases come from the same public generator code, with random row counts, row lengths, dtypes, offsets and value kinds, drawn from a seed in the `SOL_HELDOUT_SEED` environment variable. The seed is never committed, since the repo is public. Fitting the generator's distribution is fine, because that is what correctness means. Learning the cases of one seed is not, which is why the seed stays out of the repo.
 
-Elementwise ops get the softmax dev cases with every input contiguous, plus, on a 63 × 1021 shape and every dtype: each layout from `LAYOUTS` in `cases.py` (offset by one element, padded rows that each start at a new alignment, transposed, every other column, a row or column broadcast, a 0-dim float32 scalar) for one input at a time and for all inputs at once; some inputs of different dtypes; and edge values (`±inf`, `NaN`, `±0`). Held-out cases draw a layout and dtype for every input. Cases torch rejects, such as `lerp` with mixed dtypes, are dropped.
+Elementwise ops get the softmax dev cases with every input contiguous, plus the same in float64, uint8, int8, int16, int32, int64 and bool for a few row lengths, contiguous and offset by one element, with integers drawn from -70 to 70 or, for wide values, from the dtype's whole range. Then, on a 63 × 1021 shape and every dtype: each layout from `LAYOUTS` in `cases.py` (offset by one element, padded rows that each start at a new alignment, transposed, every other column, a row or column broadcast, a 0-dim float32 scalar) for one input at a time and for all inputs at once; some inputs of different dtypes; and edge values (`±inf`, `NaN`, `±0`). Held-out cases draw a layout and dtype for every input. Cases torch rejects, such as `lerp` with mixed dtypes or `bitwise_and` of floats, are dropped: each case runs once in torch on a 2 × 3 CPU tensor, since meta tensors do not check dtypes.
 
 Rows of length 1 and non-contiguous rows are not covered for softmax, because the softmax builders do not support them (open question 3).
 
@@ -82,17 +84,18 @@ Reported per perf case:
 - time per call;
 - bandwidth, from the bytes the op must move: 2 × the input size for the forward (read X, write Y), 3 × for the backward (read Y and dY, write dX);
 - SoL: bandwidth divided by the peak, which is torch's `copy_` between two 1 GiB buffers, timed the same way on the same machine in the same run;
-- speedup over torch's own op, timed the same way.
+- speedup over torch's own op, timed the same way;
+- for comparison only, torch's call under `torch.compile(dynamic=False, fullgraph=True)`, compiled afresh for the case, warmed up and timed the same way. The compile is not timed, and a compile error is reported and fails nothing.
 
 Elementwise ops are timed at 2^27 bf16 elements in three ways: contiguous, every input one element off alignment, and the second input a row broadcast. Softmax perf shapes are the old repo's `BENCH_DIMS` at 2^27 bf16 elements (256 MiB per tensor) rather than its 2^29, so that the float64 reference of the backward fits on a 16 GB card. Each perf case is also checked once, eagerly, before it is timed.
 
 ### Checking the timed graph
 
-A correct eager call says nothing about what the captured graph does. After timing, the harness poisons every output copy with NaN, gives every input copy new values at the same addresses, replays the graph once more and checks every output copy against the new reference. This catches a kernel that skips work under capture and one that returns a cached result. Both cheats are in `eval/exploits/`.
+A correct eager call says nothing about what the captured graph does. After timing, the harness poisons every output copy (with NaN, or for an integer or bool output with the complement of torch's result), gives every input copy new values at the same addresses, replays the graph once more and checks every output copy against the new reference. This catches a kernel that skips work under capture and one that returns a cached result. Both cheats are in `eval/exploits/`.
 
 ## Report
 
-`python -m sol_eval.run <op>` prints a table and writes JSON: device, torch and CuTe DSL versions, peak, then each correctness case (pass or fail, with the error) and each perf case (time, GB/s, SoL, torch time, speedup). `python -m sol_eval.run --all` does the same for every op in one process, with one peak measurement, and prints one line per op, the time spent compiling against the time spent checking and timing, and then every failure.
+`python -m sol_eval.run <op>` prints a table and writes JSON: device, torch and CuTe DSL versions, peak, then each correctness case (pass or fail, with the error) and each perf case (time, GB/s, SoL, torch time, speedup). `python -m sol_eval.run --all` does the same for every op in one process, with one peak measurement, and prints one line per op (cases passed, SoL, speedup over torch and over `torch.compile`), the time spent compiling, in `torch.compile` and checking and timing, and then every failure.
 
 Compiling dominates a run. The elementwise kernel takes shapes and strides at run time, so one compile serves every case with the same dtypes, layout pattern and vector width, and `compile_kernel` keeps each compile in an `lru_cache`. Everything runs in one process, so a compile never runs while a kernel is timed. Softmax still compiles once per case, for its row length.
 

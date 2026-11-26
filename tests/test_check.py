@@ -120,3 +120,14 @@ def test_a_16_bit_sum_fails_the_backward():
     Y, dY, t, ref, sum_size = backward_case(torch.bfloat16)
     assert compare(backward_with_sum(Y, dY, torch.float32), t, ref, "sum_scaled", sum_size) is None
     assert compare(backward_with_sum(Y, dY, torch.bfloat16), t, ref, "sum_scaled", sum_size) is not None
+
+
+def test_integer_result_one_off_fails_under_a_relative_rule():
+    # The elementwise ops' rule is "relative", made for floats. An integer result has one
+    # right answer, so it is compared exactly whatever the op's rule.
+    x = torch.randint(-100, 100, (1000,), generator=torch.Generator().manual_seed(0), dtype=torch.int32)
+    t = x.abs()
+    y = t.clone()
+    assert compare(y, t, t, "relative") is None
+    y[0] += 1
+    assert compare(y, t, t, "relative") is not None
