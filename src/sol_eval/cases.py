@@ -1,9 +1,11 @@
 """Correctness cases. Both softmax ops take a 2-D row-major tensor, so a case is a
-shape, a dtype, an offset into the allocation, a kind of values and a seed for them."""
+shape, a dtype, an offset into the allocation, a kind of values and a seed for them.
+An elementwise op's inputs broadcast to the case's shape, and each can have its own layout
+and dtype."""
 
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -12,6 +14,20 @@ DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 DEV_ROW_LENGTHS = (3, 7, 8, 17, 64, 100, 257, 511, 633, 1021, 2049, 4099,
                    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072)
 EXTRA_ROW_LENGTHS = (7, 1021, 4099, 65536)
+# how an elementwise input is laid out; each but "contiguous" takes a different path in the kernel
+LAYOUTS = (
+    "contiguous",
+    "offset",      # one element into its allocation, so not 16-byte aligned
+    "padded",      # rows 3 elements apart more than their length, so each row starts at a new alignment
+    "transposed",  # stride 1 along the rows
+    "strided",     # every other column
+    "row",         # shape (cols,), broadcast across the rows
+    "column",      # shape (rows, 1), broadcast along each row
+    "scalar",      # a 0-dim float32 tensor
+)
+# input dtypes for cases that mix them: bf16 with fp16 computes in fp32
+MIXED_DTYPES = ((torch.bfloat16, torch.float16), (torch.float16, torch.bfloat16),
+                (torch.bfloat16, torch.float32), (torch.float32, torch.float16))
 
 
 @dataclass(frozen=True)
@@ -20,11 +36,18 @@ class Case:
     cols: int
     dtype: torch.dtype
     offset: int = 0         # elements between the start of the allocation and the tensor
-    values: str = "normal"  # "normal", "wide" or "special"
+    values: str = "normal"  # "normal", "wide", "special" or "edge"
     seed: int = 0
+    layouts: tuple = ()  # one per elementwise input; none means every input is contiguous
+    dtypes: tuple = ()   # one per elementwise input; none means every input has `dtype`
 
     def __str__(self):
-        return f"{self.rows}x{self.cols}-{str(self.dtype).removeprefix('torch.')}-off{self.offset}-{self.values}"
+        name = f"{self.rows}x{self.cols}-{str(self.dtype).removeprefix('torch.')}-off{self.offset}-{self.values}"
+        if self.layouts:
+            name += "-" + ",".join(self.layouts)
+        if self.dtypes:
+            name += "-" + ",".join(str(d).removeprefix("torch.") for d in self.dtypes)
+        return name
 
 
 def dev_cases() -> list[Case]:
@@ -55,6 +78,60 @@ def heldout_cases(count: int = 100) -> list[Case]:
     return cases
 
 
+def elementwise_dev_cases(arity: int) -> list[Case]:
+    """The softmax dev cases, with every input contiguous, plus each layout and some mixed
+    dtypes on one odd shape."""
+    cases = dev_cases()
+    for d in DTYPES:
+        cases.append(Case(63, 1021, d, values="edge"))
+        for layout in LAYOUTS[1:]:
+            for i in range(arity):  # this input in the layout, the others contiguous
+                cases.append(Case(63, 1021, d, layouts=tuple(layout if j == i else "contiguous" for j in range(arity))))
+            if arity > 1:
+                cases.append(Case(63, 1021, d, layouts=(layout,) * arity))
+    if arity > 1:
+        for a, b in MIXED_DTYPES:
+            cases.append(Case(63, 1021, a, dtypes=(a, b, a)[:arity]))
+    return cases
+
+
+def elementwise_heldout_cases(arity: int, count: int = 100) -> list[Case]:
+    """heldout_cases, with a layout and a dtype drawn for every input."""
+    rng = random.Random(os.environ.get("SOL_HELDOUT_SEED", "") + f"-elementwise-{arity}")
+    cases = []
+    for case in heldout_cases(count):
+        layouts = tuple(rng.choice(LAYOUTS[:1] * 3 + LAYOUTS[1:]) for _ in range(arity))
+        dtypes = tuple(rng.choice((case.dtype,) * 3 + DTYPES) for _ in range(arity))
+        values = rng.choice((case.values, "edge"))
+        cases.append(replace(case, values=values, layouts=layouts, dtypes=dtypes))
+    return cases
+
+
+def make_input(case: Case, i: int, gen: torch.Generator) -> torch.Tensor:
+    """Input i of an elementwise op: a tensor in input i's layout and dtype that broadcasts to
+    the case's shape. Callers seed gen with case.seed."""
+    layout = case.layouts[i] if case.layouts else "contiguous"
+    c = replace(case, dtype=case.dtypes[i] if case.dtypes else case.dtype)
+    rows, cols = case.rows, case.cols
+    if layout == "contiguous":
+        return make_tensor(c, gen)
+    if layout == "offset":
+        return make_tensor(replace(c, offset=1), gen)
+    if layout == "padded":
+        return make_tensor(replace(c, cols=cols + 3), gen)[:, :cols]
+    if layout == "transposed":
+        return make_tensor(replace(c, rows=cols, cols=rows), gen).t()
+    if layout == "strided":
+        return make_tensor(replace(c, cols=2 * cols), gen)[:, ::2]
+    if layout == "row":
+        return make_tensor(replace(c, rows=1), gen)[0]
+    if layout == "column":
+        return make_tensor(replace(c, cols=1), gen)
+    if layout == "scalar":
+        return make_tensor(replace(c, rows=1, cols=1, dtype=torch.float32), gen)[0, 0]
+    raise ValueError(layout)
+
+
 def make_tensor(case: Case, gen: torch.Generator) -> torch.Tensor:
     """A tensor for the case, on the generator's device. Callers seed gen with case.seed."""
     n = case.rows * case.cols
@@ -65,4 +142,8 @@ def make_tensor(case: Case, gen: torch.Generator) -> torch.Tensor:
     elif case.values == "special":
         x[torch.rand(x.shape, generator=gen, device=gen.device) < 0.01] = float("-inf")
         x[0] = float("-inf")
+    elif case.values == "edge":  # for elementwise ops: values each op must pass through as torch does
+        u = torch.rand(x.shape, generator=gen, device=gen.device)
+        for i, v in enumerate((float("inf"), float("-inf"), float("nan"), 0.0, -0.0)):
+            x[(u >= 0.01 * i) & (u < 0.01 * (i + 1))] = v
     return x

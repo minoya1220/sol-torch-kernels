@@ -8,12 +8,19 @@ import torch
 L2_BUFFER_SIZE = 2**30  # 1 GiB is larger than L2 on any current GPU
 
 
+def copy_view(t):
+    """A copy of t's whole allocation, viewed the same way, so that the copy keeps t's
+    offset, strides and so its alignment. clone() would make it contiguous."""
+    storage = t.untyped_storage().clone()
+    return torch.empty(0, dtype=t.dtype, device=t.device).set_(storage, t.storage_offset(), t.shape, t.stride())
+
+
 def make_copies(inputs, out, iters):
     """Copies of the call's tensors, enough that one replay of `iters` calls touches at least
     1 GiB, so that no call finds its data in L2."""
-    size = sum(t.nbytes for t in inputs) + out.nbytes
+    size = sum(t.untyped_storage().nbytes() for t in inputs) + out.nbytes
     n = min(iters, -(-L2_BUFFER_SIZE // size))
-    return [(tuple(t.clone() for t in inputs), out.clone()) for _ in range(n)]
+    return [(tuple(copy_view(t) for t in inputs), out.clone()) for _ in range(n)]
 
 
 ITERS = 100  # calls per graph replay
