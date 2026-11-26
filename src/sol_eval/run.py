@@ -39,6 +39,13 @@ def run_correctness(op, build, cases) -> list[dict]:
 
 
 def run_performance(op, build, case, peak_gbps) -> dict:
+    try:
+        return time_case(op, build, case, peak_gbps)
+    except Exception as e:  # a crash fails the case, as in run_correctness, and the run goes on
+        return {"case": str(case), "passed": False, "failure": f"{type(e).__name__}: {e}"}
+
+
+def time_case(op, build, case, peak_gbps) -> dict:
     inputs = make_inputs(op, case)
     fn = build(*inputs)
     failure = check(op, fn, inputs)
