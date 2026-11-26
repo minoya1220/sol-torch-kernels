@@ -1,9 +1,12 @@
 """Elementwise apply: out = f(*inputs) per element, with torch's broadcasting.
 
-f takes one Float32 per input and returns a Float32 (or a Boolean for a comparison). As in
-torch, each float input is first rounded to the op's common dtype, then widened to Float32,
-and the result is rounded to the output dtype. A 0-dim tensor is a scalar operand and
-broadcasts like any other input.
+As in torch, each input is first converted to the op's common dtype, then to the type the
+op computes in, and f's result is converted to the output dtype. The compute type is the
+common dtype itself, except that bfloat16 and float16 compute in float32 (torch's
+opmath_type). So f takes one value per input in the compute type: Float32 for the 16- and
+32-bit floats, Float64, an integer type, or Boolean. Every conversion follows torch's
+static_cast (see cast). A 0-dim tensor is a scalar operand and broadcasts like any other
+input.
 
 Layout. The inputs are broadcast to the output shape, and neighbouring dims that every
 tensor walks as one are merged, so a contiguous 4x3x8 tensor is one run of 96. The kernel
@@ -28,19 +31,51 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32
+from cutlass import BFloat16, Boolean, Float16, Float32, Int32, Int64, Uint8
 from cutlass.cute.runtime import make_ptr
 
-# float64 and integer tensors are left out: f computes in float32. torch.bool is stored
-# as one byte, so it is read and written as Uint8.
+# How each dtype is stored. torch.bool is one byte, so it is read and written as Uint8 and
+# turned into a Boolean value after loading.
 CUTE_DTYPES = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float16: cutlass.Float16,
     torch.float32: cutlass.Float32,
+    torch.float64: cutlass.Float64,
+    torch.uint8: cutlass.Uint8,
+    torch.int8: cutlass.Int8,
+    torch.int16: cutlass.Int16,
+    torch.int32: cutlass.Int32,
+    torch.int64: cutlass.Int64,
     torch.bool: cutlass.Uint8,
 }
 THREADS = 256
 VECTOR_BYTES = 16  # the widest global load and store
+
+
+def value_type(dtype: torch.dtype):
+    """The DSL type of a dtype's values once loaded."""
+    return Boolean if dtype == torch.bool else CUTE_DTYPES[dtype]
+
+
+def compute_type(common_dtype: torch.dtype):
+    """The type f computes in: torch computes bfloat16 and float16 in float32."""
+    return Float32 if common_dtype in (torch.bfloat16, torch.float16) else value_type(common_dtype)
+
+
+def cast(x, to):
+    """x converted to the DSL type `to` as torch's static_cast_with_inter_type does
+    (c10/util/TypeCast.h). c10::Half and c10::BFloat16 are built from a float, so an
+    integer or a float64 reaches them through float32, rounding twice. A float reaches
+    uint8 through int64, so an out-of-range value wraps instead of saturating."""
+    if type(x) is to:
+        return x
+    if to is Boolean:
+        return x != 0
+    if to in (Float16, BFloat16) and type(x) not in (Float32, Float16, BFloat16):
+        return x.to(Float32).to(to)
+    if to is Uint8 and type(x).is_float:
+        return x.to(Int64).to(Uint8)
+    return x.to(to)
 
 
 def merge_dims(shape, strides):
@@ -71,14 +106,19 @@ def compile_kernel(f: Callable, dtypes: tuple, common_dtype: torch.dtype, row_st
     elem_types = [CUTE_DTYPES[d] for d in dtypes]
     sizes = [torch.empty(0, dtype=d).element_size() for d in dtypes]
     out_size = sizes[-1]
-    common = CUTE_DTYPES[common_dtype]
+    common, compute = value_type(common_dtype), compute_type(common_dtype)
+    out_value = value_type(dtypes[-1])
     n_in = len(dtypes) - 1
-    is_bool = [d == torch.bool for d in dtypes[:-1]]
 
-    def to_float(x, k):
-        if cutlass.const_expr(is_bool[k]):
-            return x.to(Float32)
-        return x.to(common).to(Float32)
+    def load(x, k):  # a stored element of input k, in the compute type
+        # an element read through a pointer argument has lost its signedness: uint8 reads as int8
+        x = cast(x, elem_types[k])
+        if cutlass.const_expr(dtypes[k] == torch.bool):
+            x = x != 0
+        return cast(cast(x, common), compute)
+
+    def store(y):  # f's result, as the output stores it
+        return cast(cast(y, out_value), elem_types[-1])
 
     @cute.kernel
     def kernel(pIn: tuple, pOut: cute.Pointer, row_len: Int32, windows: Int32, n_threads: Int32,
@@ -112,7 +152,7 @@ def compile_kernel(f: Callable, dtypes: tuple, common_dtype: torch.dtype, row_st
                         cute.autovec_copy(cute.make_tensor(src, layout), r)
                     rIn.append(r)
                 for i in cutlass.range_constexpr(vec):
-                    rOut[i] = f(*[to_float(r[i], k) for k, r in enumerate(rIn)]).to(elem_types[-1])
+                    rOut[i] = store(f(*[load(r[i], k) for k, r in enumerate(rIn)]))
                 dst = (starts[-1] + pos).align(vec * out_size)
                 cute.autovec_copy(rOut, cute.make_tensor(dst, cute.make_layout(vec)))
             else:
@@ -121,9 +161,9 @@ def compile_kernel(f: Callable, dtypes: tuple, common_dtype: torch.dtype, row_st
                         xs = []
                         for k in cutlass.range_constexpr(n_in):
                             g = cute.make_tensor(starts[k] + (pos + i) * steps[k], cute.make_layout(1))
-                            xs.append(to_float(g[0], k))
+                            xs.append(load(g[0], k))
                         out = cute.make_tensor(starts[-1] + (pos + i), cute.make_layout(1))
-                        out[0] = f(*xs).to(elem_types[-1])
+                        out[0] = store(f(*xs))
 
     @cute.jit
     def launcher(pIn: tuple, pOut: cute.Pointer, row_len: Int32, windows: Int32, n_threads: Int32,
@@ -143,7 +183,7 @@ def elementwise_builder(f: Callable, *inputs: torch.Tensor, out_like: torch.Tens
                         common_dtype: torch.dtype) -> Callable:
     """The kernel for the inputs' and the output's shapes, strides and dtypes. out_like
     (a meta tensor is fine) gives the output's shape, strides and dtype; common_dtype is the
-    dtype torch rounds the float inputs to before computing. Returns fn(*inputs, out=)."""
+    dtype torch converts the inputs to before computing. Returns fn(*inputs, out=)."""
     for x in inputs:
         assert x.dtype in CUTE_DTYPES, f"{x.dtype} is not supported"
     assert out_like.dtype in CUTE_DTYPES and common_dtype in CUTE_DTYPES
