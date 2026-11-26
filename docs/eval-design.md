@@ -91,7 +91,7 @@ Elementwise ops are timed at 2^27 bf16 elements in three ways: contiguous, every
 
 ### Checking the timed graph
 
-A correct eager call says nothing about what the captured graph does. After timing, the harness poisons every output copy with NaN, gives every input copy new values at the same addresses, replays the graph once more and checks every output copy against the new reference. This catches a kernel that skips work under capture and one that returns a cached result. Both cheats are in `eval/exploits/`.
+A correct eager call says nothing about what the captured graph does. After timing, the harness poisons every output copy (with NaN, or for an integer or bool output with the complement of torch's result), gives every input copy new values at the same addresses, replays the graph once more and checks every output copy against the new reference. This catches a kernel that skips work under capture and one that returns a cached result. Both cheats are in `eval/exploits/`.
 
 ## Report
 
