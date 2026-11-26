@@ -255,8 +255,8 @@ ELEMENTWISE_OPS = [
     ElementwiseOp("le", 2, lambda a, b: a <= b, torch.le, exact=True),
     ElementwiseOp("gt", 2, lambda a, b: a > b, torch.gt, exact=True),
     ElementwiseOp("ge", 2, lambda a, b: a >= b, torch.ge, exact=True),
-    ElementwiseOp("isnan", 1, lambda a: a != a, torch.isnan, exact=True),
-    ElementwiseOp("isinf", 1, isinf, torch.isinf, exact=True),
+    ElementwiseOp("isnan", 1, lambda a: a != a, copy_out(torch.isnan), exact=True),
+    ElementwiseOp("isinf", 1, isinf, copy_out(torch.isinf), exact=True),
     ElementwiseOp("isfinite", 1, isfinite, copy_out(torch.isfinite), exact=True),
     # nan_to_num's default replaces inf with the largest value of the output dtype, which f
     # does not know when it computes a 16-bit output in float32; finite values stand in

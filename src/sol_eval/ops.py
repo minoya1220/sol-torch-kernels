@@ -113,14 +113,15 @@ def elementwise(e: ElementwiseOp) -> Op:
         return e.torch_fn(*(x if x.dtype == torch.bool else x.double() for x in xs))
 
     def wanted(case):
-        """Whether the op is checked on this case: torch must accept the inputs' dtypes, which
-        the meta tensors do not check, so it runs on small CPU tensors."""
+        """Whether the op is checked on this case: torch must accept the inputs' dtypes in the
+        out= form the check calls, which the meta tensors do not check, so it runs on small CPU
+        tensors. A torch call with no out= form raises a TypeError here rather than drop the op."""
         xs = make_inputs(replace(case, rows=2, cols=3), torch.Generator())
         if not e.int_inputs and not all(x.is_floating_point() for i, x in enumerate(xs) if i not in e.bool_inputs):
             return False
         try:
-            e.torch_fn(*xs)
-        except RuntimeError:
+            e.torch_fn(*xs, out=torch.empty_like(out_meta(*xs), device="cpu"))
+        except (RuntimeError, ValueError, NotImplementedError):  # how torch rejects a dtype
             return False
         return True
 
