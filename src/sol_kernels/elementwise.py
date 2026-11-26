@@ -31,7 +31,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Boolean, Float16, Float32, Int32, Int64, Uint8
+from cutlass import BFloat16, Boolean, Float16, Float32, Int8, Int16, Int32, Int64, Uint8
 from cutlass.cute.runtime import make_ptr
 
 # How each dtype is stored. torch.bool is one byte, so it is read and written as Uint8 and
@@ -66,7 +66,11 @@ def cast(x, to):
     """x converted to the DSL type `to` as torch's static_cast_with_inter_type does
     (c10/util/TypeCast.h). c10::Half and c10::BFloat16 are built from a float, so an
     integer or a float64 reaches them through float32, rounding twice. A float reaches
-    uint8 through int64, so an out-of-range value wraps instead of saturating."""
+    uint8 through int64, so an out-of-range value wraps instead of saturating. Outside an
+    integer type's range a float has no defined conversion. On the card, a direct conversion
+    to int16, which saturates, differed from torch on out-of-range values, while int8 (then
+    converted through int16 and wrapped) and int32 matched. Both fit a conversion to int32
+    followed by a wrap, so int8 and int16 go that way."""
     if type(x) is to:
         return x
     if to is Boolean:
@@ -75,6 +79,8 @@ def cast(x, to):
         return x.to(Float32).to(to)
     if to is Uint8 and type(x).is_float:
         return x.to(Int64).to(Uint8)
+    if to in (Int8, Int16) and type(x).is_float:
+        return x.to(Int32).to(to)
     return x.to(to)
 
 

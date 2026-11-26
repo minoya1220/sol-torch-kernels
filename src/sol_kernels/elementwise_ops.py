@@ -59,15 +59,26 @@ def select(cond, a, b):
     return t(cutlass.select_(cond, t(a), t(b)))
 
 
-# torch's maximum, minimum and clamp return NaN if any operand is NaN
+# torch's maximum, minimum and clamp return NaN if any operand is NaN. The DSL's max and min
+# of two Booleans compare them as signed one-bit values, where true is -1, so on the card they
+# returned the other one; for bools they are or and and.
 def maximum(a, b):
     b = type(a)(b)
+    if type(a) is Boolean:
+        return a | b
     return cute.math.max(a, b, propagate_nan=True) if is_float(a) else cute.math.max(a, b)
 
 
 def minimum(a, b):
     b = type(a)(b)
+    if type(a) is Boolean:
+        return a & b
     return cute.math.min(a, b, propagate_nan=True) if is_float(a) else cute.math.min(a, b)
+
+
+def absolute(a):
+    # the DSL's abs treats uint8 as signed, so on the card abs(200) gave 56
+    return cute.math.abs(a) if is_float(a) or type(a).signed else a
 
 
 def float_only(fn):
@@ -119,9 +130,12 @@ def remainder(a, b):
 
 
 def left_shift(a, b):
-    # torch: a shift by a negative amount, or by the width or more, gives 0
+    # torch: a shift by a negative amount, or by the width or more, gives 0. The shift amount
+    # is clamped as well: given a << b under that test, LLVM's PTX backend drops the test and
+    # shifts by the low 32 bits of b, so an int64 shift by -2^63 returned a.
     t = type(a)
-    return select((b < 0) | (b >= t.width), t(0), t(a << b))
+    in_range = minimum(maximum(b, 0), t.width - 1)
+    return select((b < 0) | (b >= t.width), t(0), t(a << in_range))
 
 
 def right_shift(a, b):
@@ -222,7 +236,7 @@ CAST_DTYPES = (torch.bfloat16, torch.float16, torch.float32, torch.float64, torc
 ELEMENTWISE_OPS = [
     # arithmetic
     ElementwiseOp("neg", 1, lambda a: -a, torch.neg, exact=True),
-    ElementwiseOp("abs", 1, lambda a: cute.math.abs(a), torch.abs, exact=True),
+    ElementwiseOp("abs", 1, absolute, torch.abs, exact=True),
     ElementwiseOp("square", 1, lambda a: a * a, torch.square, exact=True),
     ElementwiseOp("reciprocal", 1, lambda a: 1.0 / a, torch.reciprocal, exact=True),
     ElementwiseOp("add", 2, lambda a, b: a + b, torch.add, exact=True),
