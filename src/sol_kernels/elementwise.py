@@ -106,11 +106,8 @@ def compile_kernel(f: Callable, dtypes: tuple, common_dtype: torch.dtype, row_st
                     r = cute.make_rmem_tensor(cute.make_layout(vec), elem_types[k])
                     src = starts[k] + pos * steps[k]
                     layout = cute.make_layout(vec, stride=steps[k])
-                    if cutlass.const_expr(row_steps[k] == 1 and vec > 1):
-                        if src.toint() % (vec * sizes[k]) == 0:
-                            cute.autovec_copy(cute.make_tensor(src.align(vec * sizes[k]), layout), r)
-                        else:
-                            cute.autovec_copy(cute.make_tensor(src, layout), r)
+                    if cutlass.const_expr(row_steps[k] == 1 and vec > 1) and src.toint() % (vec * sizes[k]) == 0:
+                        cute.autovec_copy(cute.make_tensor(src.align(vec * sizes[k]), layout), r)
                     else:
                         cute.autovec_copy(cute.make_tensor(src, layout), r)
                     rIn.append(r)
