@@ -76,3 +76,13 @@ def peak_bandwidth() -> float:
     src = torch.empty(2**30, dtype=torch.uint8, device="cuda")
     us = measure(lambda x, *, out: out.copy_(x), (src,), torch.empty_like(src))
     return 2 * src.nbytes / us / 1e3
+
+
+def peak_matmul() -> float:
+    """TFLOP/s of torch's bf16 matmul of two 8192 x 8192 matrices, timed the same way as a
+    kernel. cuBLAS accumulates in float32, as the attention kernel does: some cards run a
+    16-bit accumulator faster, and the kernel cannot use that rate."""
+    n = 8192
+    a, b = (torch.randn(n, n, device="cuda").bfloat16() for _ in range(2))
+    us = measure(lambda a, b, *, out: torch.matmul(a, b, out=out), (a, b), torch.empty_like(a))
+    return 2 * n**3 / us / 1e6

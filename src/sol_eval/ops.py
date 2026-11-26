@@ -24,13 +24,19 @@ class Op:
     torch_fn: Callable     # torch in the same call form as fn, for the checks
     torch_call: Callable   # torch's usual call, without out=, which is what is timed
     ref64: Callable        # (*inputs) -> float64 result
-    nbytes: Callable       # (*inputs) -> bytes the op must read and write
     make_out: Callable     # (*inputs) -> an empty output for fn to write
     rule: str              # the error rule in sol_eval.check
     dev_cases: Callable    # () -> correctness cases
     heldout_cases: Callable
     perf_cases: list       # cases to time
     sum_size: Callable | None = None  # (*inputs) -> per element, the size of the terms of the sum it uses
+    # Exactly one of these says what the op's speed of light is measured in.
+    nbytes: Callable | None = None  # memory-bound: (*inputs) -> bytes the op must read and write
+    flops: Callable | None = None   # compute-bound: (*inputs, **options) -> FLOPs the op must do
+    # Keyword arguments of the call that are not tensors, such as attention's is_causal and
+    # scale. They go to build, torch_fn, torch_call, ref64, sum_size and flops.
+    options: Callable = lambda case: {}
+    torch_backend: Callable | None = None  # (*inputs, **options) -> which of torch's kernels its call runs
 
 
 # 2^27 bf16 elements is 256 MiB per tensor, far above L2, while the float64
