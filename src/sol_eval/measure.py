@@ -108,11 +108,13 @@ def measure(fn, inputs, out) -> tuple[float, Clocks]:
     return time_graph(g)
 
 
-def peak_bandwidth() -> tuple[float, Clocks]:
-    """GB/s of torch's copy_ between two 1 GiB buffers, timed the same way as a kernel."""
-    src = torch.empty(2**30, dtype=torch.uint8, device="cuda")
-    us, clocks = measure(lambda x, *, out: out.copy_(x), (src,), torch.empty_like(src))
-    return 2 * src.nbytes / us / 1e3, clocks
+def ceiling_gbps(mem_mhz: float) -> float:
+    """GB/s the memory bus can move at this memory clock: its width in bytes times two
+    transfers per clock, as peak_bandwidth() in minoya1220/kernels utils/plot.py has it.
+    NVML and CUDA give the memory clock as half the data rate per pin, on GDDR and HBM alike:
+    13801 MHz on a 128-bit bus is 442 GB/s on the RTX 5060 Ti, rated 448 at 14001 MHz."""
+    bus_bits = torch.cuda.get_device_properties(torch.cuda.current_device()).memory_bus_width
+    return bus_bits / 8 * mem_mhz * 1e6 * 2 / 1e9
 
 
 def peak_flops_per_sm_clock() -> tuple[float, Clocks]:

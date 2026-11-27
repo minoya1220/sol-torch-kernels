@@ -88,10 +88,10 @@ Reported per perf case:
 
 - time per call;
 - bandwidth, from the bytes the op must move: 2 × the input size for the forward (read X, write Y), 3 × for the backward (read Y and dY, write dX);
-- SoL: bandwidth divided by the peak, which is torch's `copy_` between two 1 GiB buffers, timed the same way on the same machine in the same run;
+- SoL: bandwidth divided by what the memory bus can move at the memory clock the case ran at: the bus width in bytes × 2 transfers per clock × that clock (NVML gives the clock as half the data rate per pin), as `peak_bandwidth()` in `minoya1220/kernels` has it. A copy does not do: torch's `copy_` reached 388 GB/s on the RTX 5060 Ti, 88% of the bus's 442, while ops that read more than they write beat it: unary ops matched it, binary ops reached 1.03 of it, and comparisons (two bf16 reads, one bool write) 1.05. That fits the time memory loses turning the bus around between reads and writes, which a copy pays on half its traffic. A GPU test checks that a copy lands between half the ceiling and the ceiling, which catches a wrong bus width or clock unit;
 - speedup over torch's own op, timed the same way.
 
-Clocks: while the timed replays run, a thread reads the SM and memory clocks through NVML every 10 ms, as `MeasureMemoryClock` does in `minoya1220/kernels`, and the report gives the medians for the kernel, for torch and for each peak. A card's clocks move with its power and temperature, so a speedup measured at two different clocks says less than it seems to. Reading the clocks needs no root and works in a container. Locking them (`sudo nvidia-smi -lgc <MHz>,<MHz>`, undone with `-rgc`) needs root on the host, so on a rented container the clocks are sampled but not locked; when they are locked, the samples show it.
+Clocks: while the timed replays run, a thread reads the SM and memory clocks through NVML every 10 ms, as `MeasureMemoryClock` does in `minoya1220/kernels`, and the report gives the medians for the kernel, for torch and for the mma loop. A card's clocks move with its power and temperature, so a speedup measured at two different clocks says less than it seems to. Reading the clocks needs no root and works in a container. Locking them (`sudo nvidia-smi -lgc <MHz>,<MHz>`, undone with `-rgc`) needs root on the host, so on a rented container the clocks are sampled but not locked; when they are locked, the samples show it.
 
 Attention is compute-bound, so its SoL is achieved FLOP/s against a FLOP/s peak:
 
@@ -135,6 +135,7 @@ Compiling dominates a run. The elementwise kernel takes shapes and strides at ru
 | Claim more bytes than the op moves (F1) | Bytes come from the harness, never from the impl | this round |
 | Time with data in L2 (F2) | 1 GiB of copies per replay; reject SoL above 1.02 | partly: copies only |
 | Compare a kernel with a ceiling measured at another clock | The ceiling is taken at the clock the kernel ran at, sampled through NVML | this round |
+| Beat a measured bandwidth peak with a read-heavy op | The memory-bound ceiling is the bus's rate, not a copy | this round |
 | Slow the peak or the baseline (F3) | Measure them in a process that never loads impl code | not yet |
 | Tune only for the bench shapes, or keep stale tunings (G1 to G4) | Held-out perf shapes; kernel hash in tuning rows | not yet: no tuner |
 | Edit the harness, tests, CI or lockfile in a kernel PR (H1 to H3) | The owner reviews and merges every PR (`AGENTS.md` rule 8) | process |

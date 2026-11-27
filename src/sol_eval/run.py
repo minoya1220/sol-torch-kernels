@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 
 from sol_eval.check import check, check_graph
-from sol_eval.measure import capture, ceiling_tflops, measure, peak_bandwidth, peak_flops_per_sm_clock, time_graph
+from sol_eval.measure import capture, ceiling_gbps, ceiling_tflops, measure, peak_flops_per_sm_clock, time_graph
 from sol_eval.ops import OPS
 
 
@@ -39,8 +39,9 @@ def run_correctness(op, build, cases) -> list[dict]:
 
 
 def run_performance(op, build, case, peaks) -> dict:
-    """peaks holds "gbps" for a memory-bound op and "flops_per_sm_clock" for a compute-bound
-    one, whose ceiling is that rate at the SM clock the kernel ran at."""
+    """The ceiling is taken at the clock the kernel ran at: the memory bus at its memory clock
+    for a memory-bound op, and peaks["flops_per_sm_clock"] at its SM clock for a
+    compute-bound one."""
     inputs, options = make_inputs(op, case), op.options(case)
     fn = build(*inputs, **options)
     failure = check(op, fn, inputs, options)
@@ -62,7 +63,7 @@ def run_performance(op, build, case, peaks) -> dict:
         result["sol"] = result["tflops"] / ceiling_tflops(peaks["flops_per_sm_clock"], clocks.sm_mhz)
     else:
         result["gbps"] = op.nbytes(*inputs) / us / 1e3
-        result["sol"] = result["gbps"] / peaks["gbps"]
+        result["sol"] = result["gbps"] / ceiling_gbps(clocks.mem_mhz)
     if op.torch_backend:
         result["torch_backend"] = op.torch_backend(*inputs, **options)
     return result
@@ -139,15 +140,14 @@ def main() -> int:
         parser.error("give one op or --all")
     names = list(OPS) if args.all else [args.op]
 
-    gbps, copy_clocks = peak_bandwidth()
-    peaks = {"gbps": gbps, "copy_mem_mhz": copy_clocks.mem_mhz}
+    bus_bits = torch.cuda.get_device_properties(torch.cuda.current_device()).memory_bus_width
+    peaks = {"memory_bus_bits": bus_bits}
     if any(OPS[name].flops for name in names):
         rate, mma_clocks = peak_flops_per_sm_clock()
         peaks |= {"flops_per_sm_clock": rate, "mma_sm_mhz": mma_clocks.sm_mhz}
     reports = [run_op(OPS[name], args.heldout, peaks) for name in names]
 
-    print(f"{torch.cuda.get_device_name()}, peak copy bandwidth {gbps:.0f} GB/s at memory clock "
-          f"{copy_clocks.mem_mhz:.0f} MHz", end="")
+    print(f"{torch.cuda.get_device_name()}, {bus_bits}-bit memory bus", end="")
     print(f", bf16 mma.sync {rate:.0f} FLOP/SM/clock at SM clock {mma_clocks.sm_mhz:.0f} MHz"
           if "flops_per_sm_clock" in peaks else "")
     if args.all:
