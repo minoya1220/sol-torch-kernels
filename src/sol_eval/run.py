@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 
 from sol_eval.check import check, check_graph
-from sol_eval.measure import capture, measure, peak_bandwidth, time_graph
+from sol_eval.measure import capture, ceiling_gbps, ceiling_tflops, measure, peak_flops_per_sm_clock, time_graph
 from sol_eval.ops import OPS
 
 
@@ -29,54 +29,66 @@ def make_inputs(op, case):
 def run_correctness(op, build, cases) -> list[dict]:
     results = []
     for case in cases:
-        inputs = make_inputs(op, case)
+        inputs, options = make_inputs(op, case), op.options(case)
         try:
-            failure = check(op, build(*inputs), inputs)
+            failure = check(op, build(*inputs, **options), inputs, options)
         except Exception as e:  # a crash fails the case
             failure = f"{type(e).__name__}: {e}"
         results.append({"case": str(case), "passed": failure is None, "failure": failure})
     return results
 
 
-def run_performance(op, build, case, peak_gbps) -> dict:
-    inputs = make_inputs(op, case)
-    fn = build(*inputs)
-    failure = check(op, fn, inputs)
+def run_performance(op, build, case, peaks) -> dict:
+    """The ceiling is taken at the clock the kernel ran at: the memory bus at its memory clock
+    for a memory-bound op, and peaks["flops_per_sm_clock"] at its SM clock for a
+    compute-bound one."""
+    inputs, options = make_inputs(op, case), op.options(case)
+    fn = build(*inputs, **options)
+    failure = check(op, fn, inputs, options)
     if failure:
         return {"case": str(case), "passed": False, "failure": failure}
     g, copies = capture(fn, inputs, op.make_out(*inputs))
-    us = time_graph(g)
-    failure = check_graph(op, g, copies, make_inputs(op, replace(case, seed=case.seed + 1)))
+    us, clocks = time_graph(g)
+    failure = check_graph(op, g, copies, make_inputs(op, replace(case, seed=case.seed + 1)), options)
     if failure:
         return {"case": str(case), "passed": False, "failure": failure}
     # torch is timed in its usual call, which allocates its own output: relu(x, out=) launches
     # relu and then a copy into out. The outputs given to measure only size the L2 rotation.
-    torch_us = measure(lambda *xs, out: op.torch_call(*xs), inputs, op.make_out(*inputs))
-    gbps = op.nbytes(*inputs) / us / 1e3
-    return {"case": str(case), "passed": True, "failure": None, "us": us, "gbps": gbps,
-            "sol": gbps / peak_gbps, "torch_us": torch_us, "speedup": torch_us / us}
+    torch_us, torch_clocks = measure(lambda *xs, out: op.torch_call(*xs, **options), inputs, op.make_out(*inputs))
+    result = {"case": str(case), "passed": True, "failure": None, "us": us,
+              "sm_mhz": clocks.sm_mhz, "mem_mhz": clocks.mem_mhz, "torch_us": torch_us,
+              "torch_sm_mhz": torch_clocks.sm_mhz, "torch_mem_mhz": torch_clocks.mem_mhz, "speedup": torch_us / us}
+    if op.flops:
+        result["tflops"] = op.flops(*inputs, **options) / us / 1e6
+        result["sol"] = result["tflops"] / ceiling_tflops(peaks["flops_per_sm_clock"], clocks.sm_mhz)
+    else:
+        result["gbps"] = op.nbytes(*inputs) / us / 1e3
+        result["sol"] = result["gbps"] / ceiling_gbps(clocks.mem_mhz)
+    if op.torch_backend:
+        result["torch_backend"] = op.torch_backend(*inputs, **options)
+    return result
 
 
 def correctness_cases(op, heldout):
     return op.heldout_cases() if heldout else op.dev_cases()
 
 
-def run_op(op, heldout, peak) -> dict:
+def run_op(op, heldout, peaks) -> dict:
     compile_s = 0.0
 
-    def build(*inputs):  # a kernel compiles when it is built, so the time spent here is compile time
+    def build(*inputs, **options):  # a kernel compiles when it is built, so the time spent here is compile time
         nonlocal compile_s
         start = time.perf_counter()
-        fn = op.build(*inputs)
+        fn = op.build(*inputs, **options)
         compile_s += time.perf_counter() - start
         return fn
 
     start = time.perf_counter()
     correctness = run_correctness(op, build, correctness_cases(op, heldout))
-    performance = [run_performance(op, build, case, peak) for case in op.perf_cases]
+    performance = [run_performance(op, build, case, peaks) for case in op.perf_cases]
     run_s = time.perf_counter() - start - compile_s
-    return {"op": op.name, "correctness": correctness, "performance": performance,
-            "compile_s": compile_s, "run_s": run_s}
+    return {"op": op.name, "compute_bound": op.flops is not None, "correctness": correctness,
+            "performance": performance, "compile_s": compile_s, "run_s": run_s}
 
 
 def print_op(report):
@@ -86,10 +98,15 @@ def print_op(report):
     for r in correctness:
         if not r["passed"]:
             print(f"  FAIL {r['case']}: {r['failure']}")
-    print(f"{'case':<48} {'us':>9} {'GB/s':>7} {'SoL':>6} {'torch us':>9} {'speedup':>8}")
+    # the clock that bounds the op: SM for compute-bound, memory for memory-bound
+    unit, key, digits, clock = (("TFLOP/s", "tflops", 1, "sm_mhz") if report["compute_bound"]
+                                else ("GB/s", "gbps", 0, "mem_mhz"))
+    print(f"{'case':<48} {'us':>9} {unit:>7} {'SoL':>6} {'MHz':>5} {'torch us':>9} {'speedup':>8}")
     for r in report["performance"]:
         if r["passed"]:
-            print(f"{r['case']:<48} {r['us']:>9.1f} {r['gbps']:>7.0f} {r['sol']:>6.2f} {r['torch_us']:>9.1f} {r['speedup']:>8.2f}")
+            backend = f"  torch: {r['torch_backend']}" if "torch_backend" in r else ""
+            print(f"{r['case']:<48} {r['us']:>9.1f} {r[key]:>7.{digits}f} {r['sol']:>6.2f} {r[clock]:>5.0f} {r['torch_us']:>9.1f} "
+                  f"{r['speedup']:>8.2f}{backend}")
         else:
             print(f"{r['case']:<48} FAIL {r['failure']}")
 
@@ -123,10 +140,16 @@ def main() -> int:
         parser.error("give one op or --all")
     names = list(OPS) if args.all else [args.op]
 
-    peak = peak_bandwidth()
-    reports = [run_op(OPS[name], args.heldout, peak) for name in names]
+    bus_bits = torch.cuda.get_device_properties(torch.cuda.current_device()).memory_bus_width
+    peaks = {"memory_bus_bits": bus_bits}
+    if any(OPS[name].flops for name in names):
+        rate, mma_clocks = peak_flops_per_sm_clock()
+        peaks |= {"flops_per_sm_clock": rate, "mma_sm_mhz": mma_clocks.sm_mhz}
+    reports = [run_op(OPS[name], args.heldout, peaks) for name in names]
 
-    print(f"{torch.cuda.get_device_name()}, peak copy bandwidth {peak:.0f} GB/s")
+    print(f"{torch.cuda.get_device_name()}, {bus_bits}-bit memory bus", end="")
+    print(f", bf16 mma.sync {rate:.0f} FLOP/SM/clock at SM clock {mma_clocks.sm_mhz:.0f} MHz"
+          if "flops_per_sm_clock" in peaks else "")
     if args.all:
         print_summary(reports)
     else:
@@ -138,7 +161,7 @@ def main() -> int:
             "device": torch.cuda.get_device_name(),
             "torch": torch.__version__,
             "cutlass_dsl": importlib.metadata.version("nvidia-cutlass-dsl"),
-            "peak_gbps": peak,
+            "peaks": peaks,
             "ops": reports,
         }
         args.json.write_text(json.dumps(report, indent=2))

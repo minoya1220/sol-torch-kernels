@@ -7,9 +7,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend
 
-from sol_eval.cases import (Case, dev_cases, elementwise_dev_cases, elementwise_heldout_cases, heldout_cases,
+from sol_eval.cases import (AttentionCase, Case, attention_dev_cases, attention_heldout_cases, dev_cases,
+                            elementwise_dev_cases, elementwise_heldout_cases, heldout_cases, make_attention_inputs,
                             make_input, make_tensor)
+from sol_kernels.attention_fwd import attention_fwd_builder
 from sol_kernels.elementwise import elementwise_builder
 from sol_kernels.elementwise_ops import ELEMENTWISE_OPS, ElementwiseOp
 from sol_kernels.softmax_bwd import softmax_bwd_builder
@@ -24,13 +28,19 @@ class Op:
     torch_fn: Callable     # torch in the same call form as fn, for the checks
     torch_call: Callable   # torch's usual call, without out=, which is what is timed
     ref64: Callable        # (*inputs) -> float64 result
-    nbytes: Callable       # (*inputs) -> bytes the op must read and write
     make_out: Callable     # (*inputs) -> an empty output for fn to write
     rule: str              # the error rule in sol_eval.check
     dev_cases: Callable    # () -> correctness cases
     heldout_cases: Callable
     perf_cases: list       # cases to time
     sum_size: Callable | None = None  # (*inputs) -> per element, the size of the terms of the sum it uses
+    # Exactly one of these says what the op's speed of light is measured in.
+    nbytes: Callable | None = None  # memory-bound: (*inputs) -> bytes the op must read and write
+    flops: Callable | None = None   # compute-bound: (*inputs, **options) -> FLOPs the op must do
+    # Keyword arguments of the call that are not tensors, such as attention's is_causal and
+    # scale. They go to build, torch_fn, torch_call, ref64, sum_size and flops.
+    options: Callable = lambda case: {}
+    torch_backend: Callable | None = None  # (*inputs, **options) -> which of torch's kernels its call runs
 
 
 # 2^27 bf16 elements is 256 MiB per tensor, far above L2, while the float64
@@ -126,6 +136,80 @@ def elementwise(e: ElementwiseOp) -> Op:
               perf_cases=perf_cases)
 
 
+def attention_torch_call(q, k, v, *, is_causal, scale):
+    return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, scale=scale,
+                                          enable_gqa=q.shape[1] != k.shape[1])
+
+
+def attention_torch(q, k, v, *, out, is_causal, scale):
+    # torch has no out= form of attention, so the check copies its result; only the
+    # usual call is timed
+    return out.copy_(attention_torch_call(q, k, v, is_causal=is_causal, scale=scale))
+
+
+def attention_probs64(q, k, v, *, is_causal, scale):
+    """The float64 softmax probabilities P, and the V they weight, for one batch, head and
+    block of query rows at a time, so that P fits on the card at the perf shapes. Yields
+    (batch, head, rows, P, V)."""
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
+    group = q.shape[1] // k.shape[1]
+    sq, sk = q.shape[2], k.shape[2]
+    block = max(1, 2**25 // sk)  # 256 MiB of float64 scores
+    for b in range(q.shape[0]):
+        for h in range(q.shape[1]):
+            kh, vh = k[b, h // group].double(), v[b, h // group].double()
+            for start in range(0, sq, block):
+                rows = slice(start, min(start + block, sq))
+                s = q[b, h, rows].double() @ kh.T * scale
+                if is_causal:  # torch's causal mask: query i sees keys 0..i, also when Sq != Sk
+                    i = torch.arange(rows.start, rows.stop, device=q.device)[:, None]
+                    s.masked_fill_(torch.arange(sk, device=q.device) > i, float("-inf"))
+                yield b, h, rows, torch.softmax(s, dim=-1), vh
+
+
+def attention_ref64(q, k, v, *, is_causal, scale):
+    out = torch.empty(q.shape, dtype=torch.float64, device=q.device)
+    for b, h, rows, p, vh in attention_probs64(q, k, v, is_causal=is_causal, scale=scale):
+        out[b, h, rows] = p @ vh
+    return out
+
+
+def attention_sum_size(q, k, v, *, is_causal, scale):
+    # O_id = sum_j P_ij V_jd. A correct 16-bit kernel rounds each P_ij once to the input
+    # dtype, and those roundings add up like a random walk: to the root sum of squares of
+    # the terms, not to the sum of their sizes.
+    out = torch.empty(q.shape, dtype=torch.float64, device=q.device)
+    for b, h, rows, p, vh in attention_probs64(q, k, v, is_causal=is_causal, scale=scale):
+        out[b, h, rows] = (p * p @ (vh * vh)).sqrt()
+    return out
+
+
+def attention_flops(q, k, v, *, is_causal, scale):
+    """Two matmuls, S = Q K^T and O = P V, of 2 FLOPs per multiply-add over every (query, key)
+    pair the op scores. Causal scores key j for query i only if j <= i: about half the pairs."""
+    batch, heads, sq, d = q.shape
+    sk = k.shape[2]
+    pairs = sum(min(i + 1, sk) for i in range(sq)) if is_causal else sq * sk
+    return 4 * batch * heads * pairs * d
+
+
+def attention_backend(q, k, v, *, is_causal, scale):
+    """The kernel torch's dispatcher picks for this call: flash, efficient, cudnn or math."""
+    choice = torch._fused_sdp_choice(q, k, v, None, 0.0, is_causal, scale=scale, enable_gqa=q.shape[1] != k.shape[1])
+    return SDPBackend(choice).name.lower()
+
+
+# Compute-bound at these shapes: about 2 * S FLOPs per byte of q, k, v and O. Two head dims,
+# full and causal, one grouped-query shape and one in float16.
+ATTENTION_PERF_CASES = [AttentionCase(b, h, kv, s, s, d, dtype, causal, seed=1)
+                        for b, h, kv, s, d, dtype in ((4, 16, 16, 4096, 64, torch.bfloat16),
+                                                      (4, 16, 16, 4096, 128, torch.bfloat16),
+                                                      (1, 8, 8, 16384, 128, torch.bfloat16),
+                                                      (4, 32, 8, 4096, 128, torch.bfloat16),
+                                                      (4, 16, 16, 4096, 128, torch.float16))
+                        for causal in (False, True)]
+
+
 OPS = {
     "softmax_fwd": Op("softmax_fwd", softmax_fwd_builder, fwd_inputs, fwd_torch, fwd_torch_call, fwd_ref64,
                       nbytes=lambda X: 2 * X.nbytes, make_out=torch.empty_like, rule="max_scaled",
@@ -134,4 +218,10 @@ OPS = {
                       nbytes=lambda Y, dY: 3 * Y.nbytes, make_out=lambda Y, dY: torch.empty_like(Y),
                       rule="sum_scaled", dev_cases=dev_cases, heldout_cases=heldout_cases,
                       perf_cases=SOFTMAX_PERF_CASES, sum_size=bwd_sum_size),
+    "attention_fwd": Op("attention_fwd", attention_fwd_builder, make_attention_inputs, attention_torch,
+                        attention_torch_call, attention_ref64, make_out=lambda q, k, v: torch.empty_like(q),
+                        rule="rss_scaled", dev_cases=attention_dev_cases, heldout_cases=attention_heldout_cases,
+                        perf_cases=ATTENTION_PERF_CASES, sum_size=attention_sum_size, flops=attention_flops,
+                        options=lambda case: {"is_causal": case.causal, "scale": case.scale},
+                        torch_backend=attention_backend),
 } | {e.name: elementwise(e) for e in ELEMENTWISE_OPS}

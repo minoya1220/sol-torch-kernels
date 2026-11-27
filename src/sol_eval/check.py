@@ -6,14 +6,16 @@ import torch
 
 # K per error rule. "max_scaled" (softmax forward) measures small entries against the largest
 # one; "relative" (elementwise ops) measures every entry against itself; "sum_scaled" (softmax
-# backward) measures every entry against the larger of itself and the size of the sum it uses.
-K = {"max_scaled": 4, "sum_scaled": 4, "relative": 2}
+# backward) measures every entry against the larger of itself and the size of the sum it uses;
+# "rss_scaled" (attention) against the larger of itself and the root sum of squares of the
+# terms of its sum.
+K = {"max_scaled": 4, "sum_scaled": 4, "relative": 2, "rss_scaled": 4}
 
 
 def error(x: torch.Tensor, ref: torch.Tensor, rule: str, sum_size: torch.Tensor | None = None) -> torch.Tensor:
     """Error of each element of x, in units of eps of x's dtype, over the elements where ref
     rounded to x's dtype is finite. For "sum_scaled", sum_size gives, per element, the size of
-    the summed terms its value depends on."""
+    the summed terms its value depends on; for "rss_scaled", their root sum of squares."""
     info = torch.finfo(x.dtype)
     finite = ref.to(x.dtype).isfinite()
     r = ref[finite]
@@ -24,6 +26,9 @@ def error(x: torch.Tensor, ref: torch.Tensor, rule: str, sum_size: torch.Tensor 
     if rule == "sum_scaled":
         # the sum may carry a float32 sum's rounding error, whatever x's dtype
         scale = torch.maximum(scale, torch.finfo(torch.float32).eps / info.eps * sum_size[finite])
+    if rule == "rss_scaled":
+        # each term may carry one rounding in x's dtype, as P does in flash attention
+        scale = torch.maximum(scale, sum_size[finite])
     scale = scale.clamp_min(floor)
     return (x.double()[finite] - r).abs() / (info.eps * scale)
 
@@ -62,23 +67,24 @@ def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str,
     return None
 
 
-def references(op, inputs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+def references(op, inputs, options) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """torch's result, the float64 reference and the op's sum sizes for these inputs."""
     t = op.make_out(*inputs)
-    op.torch_fn(*inputs, out=t)
-    sum_size = op.sum_size(*inputs) if op.sum_size else None
-    return t, op.ref64(*inputs), sum_size
+    op.torch_fn(*inputs, out=t, **options)
+    sum_size = op.sum_size(*inputs, **options) if op.sum_size else None
+    return t, op.ref64(*inputs, **options), sum_size
 
 
-def check(op, fn, inputs) -> str | None:
-    """Run fn once on inputs and compare its output; None if it passes."""
-    t, ref, sum_size = references(op, inputs)
+def check(op, fn, inputs, options) -> str | None:
+    """Run fn once on inputs and compare its output; None if it passes. options are the
+    case's non-tensor arguments, which fn was built with."""
+    t, ref, sum_size = references(op, inputs, options)
     y = op.make_out(*inputs)
     fn(*inputs, out=y)
     return compare(y, t, ref, op.rule, sum_size)
 
 
-def check_graph(op, g, copies, new_inputs) -> str | None:
+def check_graph(op, g, copies, new_inputs, options) -> str | None:
     """Give every input copy new values at the same addresses, poison every output copy with
     NaN, replay the timed graph once, and compare every output copy. A call that did its work
     eagerly but not under the graph leaves NaN behind; one that returns a result cached from
@@ -88,7 +94,7 @@ def check_graph(op, g, copies, new_inputs) -> str | None:
             a.copy_(b)
         y.fill_(float("nan"))
     g.replay()
-    t, ref, sum_size = references(op, new_inputs)
+    t, ref, sum_size = references(op, new_inputs, options)
     for _, y in copies:
         failure = compare(y, t, ref, op.rule, sum_size)
         if failure:
