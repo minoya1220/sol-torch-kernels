@@ -62,35 +62,61 @@ def compare(y: torch.Tensor, t: torch.Tensor, ref: torch.Tensor, rule: str,
     return None
 
 
-def references(op, inputs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """torch's result, the float64 reference and the op's sum sizes for these inputs."""
-    t = op.make_out(*inputs)
-    op.torch_fn(*inputs, out=t)
-    sum_size = op.sum_size(*inputs) if op.sum_size else None
-    return t, op.ref64(*inputs), sum_size
+def as_tuple(x):
+    return x if isinstance(x, tuple) else (x,)
 
 
-def check(op, fn, inputs) -> str | None:
-    """Run fn once on inputs and compare its output; None if it passes."""
-    t, ref, sum_size = references(op, inputs)
-    y = op.make_out(*inputs)
+def references(op, inputs, options) -> tuple[tuple, tuple, tuple]:
+    """torch's result, the float64 reference and the op's sum sizes for these inputs, each a
+    tuple with one entry per output."""
+    t = op.make_out(*inputs, **options)
+    op.torch_fn(*inputs, out=t, **options)
+    t = as_tuple(t)
+    sum_size = as_tuple(op.sum_size(*inputs, **options)) if op.sum_size else (None,) * len(t)
+    return t, as_tuple(op.ref64(*inputs, **options)), sum_size
+
+
+def compare_all(op, y, references) -> str | None:
+    """compare on every output, each under its own rule."""
+    rules = op.rule if isinstance(op.rule, tuple) else (op.rule,)
+    for i, (y, t, ref, rule, sum_size) in enumerate(zip(as_tuple(y), *references[:2], rules, references[2])):
+        failure = compare(y, t, ref, rule, sum_size)
+        if failure:
+            return f"output {i}: {failure}" if len(rules) > 1 else failure
+    return None
+
+
+def check(op, fn, inputs, options) -> str | None:
+    """Run fn once on inputs and compare its outputs; None if it passes. options are the
+    case's non-tensor arguments, which fn was built with."""
+    y = op.make_out(*inputs, **options)
     fn(*inputs, out=y)
-    return compare(y, t, ref, op.rule, sum_size)
+    return compare_all(op, y, references(op, inputs, options))
 
 
-def check_graph(op, g, copies, new_inputs) -> str | None:
-    """Give every input copy new values at the same addresses, poison every output copy with
-    NaN, replay the timed graph once, and compare every output copy. A call that did its work
-    eagerly but not under the graph leaves NaN behind; one that returns a result cached from
-    earlier inputs returns the wrong values."""
+def poison(y: torch.Tensor, t: torch.Tensor):
+    """Fill y with what no correct call writes where torch wrote t: NaN, or for an index or a
+    bool the complement of torch's result."""
+    if y.is_floating_point():
+        y.fill_(float("nan"))
+    else:
+        y.copy_(~t)
+
+
+def check_graph(op, g, copies, new_inputs, options) -> str | None:
+    """Give every input copy new values at the same addresses, poison every output copy,
+    replay the timed graph once, and compare every output copy. A call that did its work
+    eagerly but not under the graph leaves the poison behind; one that returns a result cached
+    from earlier inputs returns the wrong values."""
+    refs = references(op, new_inputs, options)
     for x, y in copies:
         for a, b in zip(x, new_inputs):
             a.copy_(b)
-        y.fill_(float("nan"))
+        for a, t in zip(as_tuple(y), refs[0]):
+            poison(a, t)
     g.replay()
-    t, ref, sum_size = references(op, new_inputs)
     for _, y in copies:
-        failure = compare(y, t, ref, op.rule, sum_size)
+        failure = compare_all(op, y, refs)
         if failure:
             return f"after a graph replay: {failure}"
     return None
