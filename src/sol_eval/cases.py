@@ -6,6 +6,7 @@ and dtype."""
 import os
 import random
 from dataclasses import dataclass, replace
+from math import prod
 
 import torch
 
@@ -147,3 +148,120 @@ def make_tensor(case: Case, gen: torch.Generator) -> torch.Tensor:
         for i, v in enumerate((float("inf"), float("-inf"), float("nan"), 0.0, -0.0)):
             x[(u >= 0.01 * i) & (u < 0.01 * (i + 1))] = v
     return x
+
+
+# How a reduction's input is laid out; each but "contiguous" takes a different path in the kernel
+REDUCTION_LAYOUTS = (
+    "contiguous",
+    "offset",      # one element into its allocation, so not 16-byte aligned
+    "padded",      # the last dim 3 elements apart more than its length
+    "transposed",  # the last two dims swapped, so stride 1 along the second to last
+    "strided",     # every other element along the last dim
+)
+
+
+@dataclass(frozen=True)
+class ReductionCase:
+    """The input's shape, dtype, layout and values, the dims reduced (an int, a tuple, or None
+    for every dim), keepdim, and the correction that var and std take."""
+    shape: tuple
+    dim: int | tuple | None
+    dtype: torch.dtype
+    keepdim: bool = False
+    layout: str = "contiguous"
+    values: str = "normal"  # make_tensor's, or "ties" (small integers) or "shifted" (1000 + randn)
+    seed: int = 0
+    correction: int = 1
+
+    def __str__(self):
+        name = "x".join(map(str, self.shape)) or "scalar"
+        name += f"-dim{self.dim}".replace(" ", "") + ("-keepdim" if self.keepdim else "")
+        name += f"-{str(self.dtype).removeprefix('torch.')}-{self.layout}-{self.values}"
+        return name + (f"-correction{self.correction}" if self.correction != 1 else "")
+
+
+def reduction_dev_cases(bool_input: bool = False) -> list[ReductionCase]:
+    """Reduced dims inner and outer, short to very long, ones that need the split path, length-1
+    and empty dims, the layouts and the value kinds."""
+    cases = []
+    for d in DTYPES:
+        cases += [ReductionCase((63, n), -1, d) for n in DEV_ROW_LENGTHS]
+        cases += [ReductionCase((n, 63), 0, d) for n in (3, 17, 1021, 4099, 65536)]
+        cases += [
+            ReductionCase((63, 1021), -1, d, keepdim=True),
+            ReductionCase((1021, 1021), 0, d),  # each reduced element of a column at a new alignment
+            ReductionCase((7, 1021, 9), 1, d),
+            ReductionCase((7, 1021, 9), (0, 2), d),  # two reduced dims that do not merge
+            ReductionCase((5, 6, 7, 8), (1, 3), d, keepdim=True),
+            ReductionCase((63, 1021), None, d),
+            ReductionCase((2, 2**20 + 3), -1, d),  # a few long rows: split across blocks
+            ReductionCase((2**20 + 3, 5), 0, d),
+            ReductionCase((2**22,), None, d),
+            ReductionCase((63, 1), -1, d),  # length-1 dims
+            ReductionCase((1, 1021), 0, d),
+            ReductionCase((5, 1, 7), 1, d),
+            ReductionCase((), None, d),
+            ReductionCase((63, 0), -1, d),  # empty reductions, which some ops allow
+            ReductionCase((0, 63), 0, d),
+            ReductionCase((0, 63), -1, d),  # no outputs
+        ]
+        for dim in (-1, 0):
+            cases += [ReductionCase((63, 1021), dim, d, layout=layout) for layout in REDUCTION_LAYOUTS[1:]]
+            cases += [ReductionCase((63, 1021), dim, d, values=v) for v in ("wide", "special", "edge", "ties", "shifted")]
+        cases += [ReductionCase((63, 1021), -1, d, correction=c) for c in (0, 2)]
+    if bool_input:
+        cases += [ReductionCase((63, n), -1, torch.bool, values="edge") for n in (3, 17, 1021, 65536)]
+        cases += [ReductionCase((1021, 63), 0, torch.bool, values="edge"), ReductionCase((63, 1021), None, torch.bool)]
+    return cases
+
+
+def reduction_heldout_cases(bool_input: bool = False, count: int = 100) -> list[ReductionCase]:
+    """Cases from the same family as the dev cases, drawn from SOL_HELDOUT_SEED."""
+    seed = os.environ.get("SOL_HELDOUT_SEED")
+    if not seed:
+        raise RuntimeError("set SOL_HELDOUT_SEED to run the held-out cases")
+    rng = random.Random(seed + "-reduction")
+    dtypes = DTYPES + ((torch.bool,) if bool_input else ())
+    cases = []
+    for _ in range(count):
+        ndim = rng.randint(1, 4)
+        shape = [max(1, round(2 ** rng.uniform(0, 22 / ndim))) if rng.random() < 0.9 else 1 for _ in range(ndim)]
+        kind = rng.choice(("one", "one", "some", "all"))
+        if kind == "one":
+            dim = rng.randrange(-ndim, ndim)
+        elif kind == "some":
+            dim = tuple(sorted(rng.sample(range(ndim), rng.randint(1, ndim))))
+        else:
+            dim = None
+        layouts = REDUCTION_LAYOUTS if ndim > 1 else ("contiguous", "offset", "padded", "strided")
+        values = rng.choice(("normal", "normal", "wide", "special", "edge", "ties", "shifted"))
+        cases.append(ReductionCase(tuple(shape), dim, rng.choice(dtypes), rng.random() < 0.3, rng.choice(layouts),
+                                   values, seed=rng.getrandbits(63), correction=rng.choice((0, 1, 1))))
+    return cases
+
+
+def make_reduction_input(case: ReductionCase, gen: torch.Generator) -> torch.Tensor:
+    """The case's input, in its layout. Callers seed gen with case.seed."""
+    shape = list(case.shape)
+    dtype = torch.float32 if case.dtype == torch.bool else case.dtype
+    values = "normal" if case.values in ("ties", "shifted") else case.values
+    alloc = list(shape)  # the shape that is allocated, before the view
+    if case.layout == "padded":
+        alloc[-1] += 3
+    elif case.layout == "strided":
+        alloc[-1] *= 2
+    elif case.layout == "transposed":
+        alloc[-2:] = alloc[:-3:-1]
+    flat = Case(prod(alloc[:-1]), alloc[-1] if alloc else 1, dtype, offset=int(case.layout == "offset"), values=values)
+    x = make_tensor(flat, gen).view(alloc)
+    if case.layout == "padded":
+        x = x[..., :shape[-1]]
+    elif case.layout == "strided":
+        x = x[..., ::2]
+    elif case.layout == "transposed":
+        x = x.transpose(-1, -2)
+    if case.values == "ties":  # many equal values, so that argmax and max must break ties as torch does
+        x.copy_((x * 2).round())
+    elif case.values == "shifted":  # a mean far from 0: a variance taken as E[x^2] - E[x]^2 loses its digits
+        x.add_(1000)
+    return x != 0 if case.dtype == torch.bool else x

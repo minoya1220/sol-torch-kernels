@@ -120,3 +120,56 @@ def test_a_16_bit_sum_fails_the_backward():
     Y, dY, t, ref, sum_size = backward_case(torch.bfloat16)
     assert compare(backward_with_sum(Y, dY, torch.float32), t, ref, "sum_scaled", sum_size) is None
     assert compare(backward_with_sum(Y, dY, torch.bfloat16), t, ref, "sum_scaled", sum_size) is not None
+
+
+def sum_case(dtype):
+    """Rows of normal values whose last term cancels the rest, so each row's sum is close to 0
+    and its float32 rounding error is large against the sum itself."""
+    op = OPS["sum"]
+    x = torch.randn(63, 4099, generator=torch.Generator().manual_seed(0)).to(dtype)
+    x[:, -1] = 0
+    x[:, -1] = (-x.double().sum(-1)).to(dtype)
+    o = {"dim": -1, "keepdim": False}
+    (t,) = op.make_out(x, **o)
+    op.torch_fn(x, out=(t,), **o)
+    return x, t, op.ref64(x, **o)[0], op.sum_size(x, **o)[0]
+
+
+def blocked_sum(x, dtype, chains=256):
+    """A row sum as a kernel takes it: chains partial sums, each over every chains-th element
+    and kept in dtype, then added left to right."""
+    s = torch.zeros(x.shape[0], chains, dtype=dtype)
+    x = torch.nn.functional.pad(x, (0, -x.shape[1] % chains)).view(x.shape[0], -1, chains)
+    for k in range(x.shape[1]):
+        s = (s.float() + x[:, k].float()).to(dtype)
+    return sequential_sum(s, dtype).to(x.dtype)
+
+
+def test_a_float32_sum_in_another_order_passes_a_reduction():
+    # Against torch's error on each row alone, a float32 sum in another order than torch's
+    # fails wherever torch's sum happened to land close; against the size of the terms, it passes.
+    x, t, ref, sum_size = sum_case(torch.float32)
+    y = blocked_sum(x, torch.float32)
+    assert compare(y, t, ref, "relative") is not None
+    assert compare(y, t, ref, "sum_scaled", sum_size) is None
+
+
+def test_a_16_bit_sum_fails_a_reduction():
+    x, t, ref, sum_size = sum_case(torch.bfloat16)
+    assert compare(blocked_sum(x, torch.float32), t, ref, "sum_scaled", sum_size) is None
+    assert compare(blocked_sum(x, torch.bfloat16), t, ref, "sum_scaled", sum_size) is not None
+
+
+def test_a_variance_from_the_mean_of_squares_fails():
+    # E[x^2] - E[x]^2 loses its digits when the mean is far from 0; Welford's update does not
+    op = OPS["var"]
+    x = torch.randn(63, 1021, generator=torch.Generator().manual_seed(0)) + 1000
+    o = {"dim": -1, "keepdim": False, "correction": 1}
+    (t,) = op.make_out(x, **o)
+    op.torch_fn(x, out=(t,), **o)
+    ref, sum_size = op.ref64(x, **o)[0], op.sum_size(x, **o)[0]
+    n = x.shape[1]
+    two_pass = (x - x.mean(-1, keepdim=True)).square().sum(-1) / (n - 1)
+    naive = (x.square().sum(-1) - x.sum(-1).square() / n) / (n - 1)
+    assert compare(two_pass, t, ref, "sum_scaled", sum_size) is None
+    assert compare(naive, t, ref, "sum_scaled", sum_size) is not None
