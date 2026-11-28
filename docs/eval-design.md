@@ -17,6 +17,8 @@ The builder compiles once; the returned function only launches. The harness buil
 
 Elementwise ops share one builder, `elementwise_builder(f, *inputs, out_like=, common_dtype=)`, where `f` is the op's function of float32 values. `sol_kernels/elementwise_ops.py` lists the ops as data: name, arity, `f` and the torch call to match. Run on meta tensors, the torch call gives the output's shape, strides and dtype (`out_like`), so the output is laid out as torch lays it out. The elementwise kernel is compiled per dtype, layout pattern and vector width, and takes shapes, strides and addresses at run time. It finds each row's alignment at run time and peels the unaligned head and tail of a row inside the same kernel.
 
+Reductions share a second builder, `reduction_builder(op, *inputs, dims=, outs_like=, params=)`. `sol_kernels/reduction_ops.py` lists them as data: the parts of a float32 or int32 state, its identity, how one element is folded in, how two states merge, how a state becomes the stored values, and the torch call to match, which gives the outputs' layout on meta tensors. Softmax and its backward, `layer_norm` and `rms_norm` are reductions with an epilogue that writes a full-size output from each row's finished state. A reduction op's call takes `dim` and `keepdim` (and `correction` for `var` and `std`), which the harness passes as the case's options to the builder, both torch calls, the reference and the sum sizes.
+
 The builder derives the vector width from the real pointer alignment of its tensors. The old builders passed `assumed_align=16` unconditionally, which is a false promise for a view at an odd offset.
 
 ## Correctness
@@ -43,6 +45,8 @@ s_i  = max(|r_i|, smallest normal of the dtype)                       elementwis
 e_i(x) = |x_i - r_i| / (eps * s_i)
 pass: e_i(y) <= K * max(e_i(t), 1) for every i where r_i, rounded to the output dtype, is finite,
       with K = 4 for softmax and 2 for elementwise
+s_i  = max(|r_i|, (eps_f32 / eps) * A_i, smallest normal)            sum, mean, var, std, norm 1 and 2,
+       with A_i the sum size of output i below                       logsumexp, layer_norm, rms_norm
 ```
 
 Why this rule and not a fixed `atol` and `rtol`:
@@ -52,6 +56,8 @@ Why this rule and not a fixed `atol` and `rtol`:
 - For softmax forward, the scale `s_i` gives relative error for large entries and absolute error, at the size of the largest entry, for entries far below it. An elementwise output stands alone, so each element is measured against itself: under the softmax scale, zeroing every bf16 product below 1e-3 passed, and so would flushing subnormal results to zero.
 - In the backward, dX_i = Y_i (dY_i - S) for the row sum S = sum_j Y_j dY_j. Where dY_i is close to S, dX_i is tiny and its error is Y_i times S's error. Torch's error there only says how close torch's sum landed on that row, so measured against |r_i| alone, a float32 sum as accurate as torch's but in another order failed 33 of 35 float32 cases on the card. A floating-point sum's error is a few eps times the sum of its terms' sizes, so the scale admits Y_i * A, in float32 units whatever the output dtype: S may carry a float32 sum's error and no more.
 - The factor 4 allows a different summation order with float32 accumulation and rejects accumulation in a 16-bit type. `tests/test_check.py` checks both for the backward. An elementwise op has no sum to reorder, so 2 leaves room only for a different implementation of the same function.
+- Reductions follow the backward: a float sum in another order than torch's is not wrong, so each float output is measured against the size of the terms it sums, in float32 units, and K is 4 (`sum_scaled`). The sum size A of an output is the error a sum of float32 roundings of its terms could put there, carried through the rest of its formula: `sum(|x|)` for sum, `mean(|x|)` for mean, `norm` itself for norm 1, `norm / 2` for norm 2 (the square root halves a relative error), and 1 for logsumexp (log of a sum s moves by s's relative error). For var it is `(sum (x - m)^2 + 2 mean|x| sum |x - m|) / (n - correction)`: besides the squares, each deviation carries the error of the mean, which Welford's update and the merge of partial states both make. For std it is var's divided by `2 std`. For layer_norm, with `rstd = (v + eps)^-1/2`, an output gets `|w| rstd mean|x|` from the mean's error and `|out - b| A_var / (2 (v + eps))` from the variance's; rms_norm likewise with the mean of squares. `REDUCTION_SUM_SIZES` in `ops.py` holds the formulas. The bound admits float32 sums whose serial chains are short and whose partial sums merge in a tree, as torch's and these kernels' do (each thread keeps one state per element of its vector window). One long serial chain of positive terms does not pass: on CPU, a sum of 2^20 values in [0, 1) folded into 4096 chains and then added left to right was 10 units off. `tests/test_check.py` checks that a float32 sum in another order passes where torch's error on each row alone would fail it, that a bf16 accumulation fails, and that a variance taken as E[x^2] - E[x]^2 fails on values with a mean far from 0.
+- The reductions that pick an element or compare (`amax`, `amin`, `max` and `min` with their indices, `argmax`, `argmin`, `norm` with p = inf, `all`, `any`) are exact. Indices must equal torch's: on ties torch returns the first index along the reduced dims in row-major order, NaN counts as larger than any number for max and smaller for min (so the first NaN wins), and +0 and -0 tie, so the first of them wins. `max` and `min` return that element's value, which then fixes the sign of a zero result.
 
 Where `r_i`, rounded to the output dtype, is NaN or infinite, `y_i` must be NaN or the same infinity, so a result too large for the dtype must overflow. Measured as finite instead, such an element gave torch an infinite error and so an infinite bound. A NaN where the rounded `r_i` is finite makes `E` NaN, which fails.
 
@@ -66,7 +72,9 @@ Held-out cases come from the same public generator code, with random row counts,
 
 Elementwise ops get the softmax dev cases with every input contiguous, plus, on a 63 × 1021 shape and every dtype: each layout from `LAYOUTS` in `cases.py` (offset by one element, padded rows that each start at a new alignment, transposed, every other column, a row or column broadcast, a 0-dim float32 scalar) for one input at a time and for all inputs at once; some inputs of different dtypes; and edge values (`±inf`, `NaN`, `±0`). Held-out cases draw a layout and dtype for every input. Cases torch rejects, such as `lerp` with mixed dtypes, are dropped.
 
-Rows of length 1 and non-contiguous rows are not covered for softmax, because the softmax builders do not support them (open question 3).
+The softmax cases have no rows of length 1 and no non-contiguous rows. Softmax now runs on the reduction builder, which takes both, and the reduction cases cover them for the builder (open question 3).
+
+Reduction ops get one family of cases (`reduction_dev_cases` in `cases.py`), on every float dtype: one dim reduced, innermost (rows of every length in the softmax list) and outermost (columns); keepdim; two dims that do not merge; every dim; the split path, with a few rows of 2^20 + 3 or a column of that length, and 2^22 elements reduced to one; length-1 dims and a 0-dim input; empty reductions and an empty output; each layout in `REDUCTION_LAYOUTS` (offset, padded, transposed, every other element) with the inner and the outer dim reduced; values scaled by 100, special (`-inf`), edge (`±inf`, `NaN`, `±0`), small integers with many ties, and a mean of 1000; and correction 0 and 2 for var and std. `all` and `any` also get bool inputs. Cases torch rejects, such as `amax` over an empty dim or `max` over two dims, are dropped per op. Held-out cases draw a rank, a shape, the dims, keepdim, a layout, values and a correction. `layer_norm` and `rms_norm` take the softmax cases, normalising each row with a weight (and a bias) of its length.
 
 ## Performance
 
@@ -84,11 +92,11 @@ Reported per perf case:
 - SoL: bandwidth divided by the peak, which is torch's `copy_` between two 1 GiB buffers, timed the same way on the same machine in the same run;
 - speedup over torch's own op, timed the same way.
 
-Elementwise ops are timed at 2^27 bf16 elements in three ways: contiguous, every input one element off alignment, and the second input a row broadcast. Softmax perf shapes are the old repo's `BENCH_DIMS` at 2^27 bf16 elements (256 MiB per tensor) rather than its 2^29, so that the float64 reference of the backward fits on a 16 GB card. Each perf case is also checked once, eagerly, before it is timed.
+Reductions are timed at 2^27 bf16 elements as 2^15 rows of 2^12, 16 rows of 2^23 (the split path), 2^15 columns of 2^12 and one sum of everything; the bytes moved are the input and every output. Elementwise ops are timed at 2^27 bf16 elements in three ways: contiguous, every input one element off alignment, and the second input a row broadcast. Softmax perf shapes are the old repo's `BENCH_DIMS` at 2^27 bf16 elements (256 MiB per tensor) rather than its 2^29, so that the float64 reference of the backward fits on a 16 GB card. Each perf case is also checked once, eagerly, before it is timed.
 
 ### Checking the timed graph
 
-A correct eager call says nothing about what the captured graph does. After timing, the harness poisons every output copy with NaN, gives every input copy new values at the same addresses, replays the graph once more and checks every output copy against the new reference. This catches a kernel that skips work under capture and one that returns a cached result. Both cheats are in `eval/exploits/`.
+A correct eager call says nothing about what the captured graph does. After timing, the harness poisons every output copy (NaN for floats, the complement of torch's result for indices and bools), gives every input copy new values at the same addresses, replays the graph once more and checks every output copy against the new reference. This catches a kernel that skips work under capture and one that returns a cached result. Both cheats are in `eval/exploits/`.
 
 ## Report
 
@@ -126,7 +134,7 @@ Compiling dominates a run. The elementwise kernel takes shapes and strides at ru
 | Assume an alignment the input does not have (I4) | Cases at an offset of one element | this round |
 | 32-bit index overflow (I5) | Cases over 2^31 elements | not yet |
 | Nondeterminism (J1) | Run twice and compare bitwise | not yet |
-| Non-contiguous, broadcast and aliased layouts (J3, J4) | Layout cases | not yet: softmax takes contiguous rows |
+| Non-contiguous, broadcast and aliased layouts (J3, J4) | Layout cases | elementwise and reductions; not aliasing |
 
 Also deferred: a separate verifier process that holds the seed and judges outputs it did not produce, NVML clock and power monitoring, and CI on a GPU.
 
@@ -134,4 +142,4 @@ Also deferred: a separate verifier process that holds the seed and judges output
 
 1. **Acceptance gate.** What makes a kernel PR mergeable? A proposal: every dev and held-out case passes, and no perf case is slower than torch. A SoL target per op can come once the first ops show what is reachable.
 2. **Reference GPU.** The RTX 5060 Ti and 5090 differ about 4× in bandwidth and 3× in L2. Report per device and gate on one of them?
-3. **Coverage.** Should the softmax kernels support rows of length 1 and non-contiguous rows, so that the harness tests every shape torch accepts?
+3. **Coverage.** Softmax on the reduction builder takes rows of length 1 and non-contiguous rows. Should its cases cover them too, so that the harness tests every shape torch accepts?

@@ -18,9 +18,11 @@ def copy_view(t):
 def make_copies(inputs, out, iters):
     """Copies of the call's tensors, enough that one replay of `iters` calls touches at least
     1 GiB, so that no call finds its data in L2."""
-    size = sum(t.untyped_storage().nbytes() for t in inputs) + out.nbytes
-    n = min(iters, -(-L2_BUFFER_SIZE // size))
-    return [(tuple(copy_view(t) for t in inputs), out.clone()) for _ in range(n)]
+    outs = out if isinstance(out, tuple) else (out,)  # an op may have several outputs
+    size = sum(t.untyped_storage().nbytes() for t in inputs) + sum(t.nbytes for t in outs)
+    n = min(iters, -(-L2_BUFFER_SIZE // max(size, 1)))
+    clone = (lambda: tuple(t.clone() for t in out)) if isinstance(out, tuple) else out.clone
+    return [(tuple(copy_view(t) for t in inputs), clone()) for _ in range(n)]
 
 
 ITERS = 100  # calls per graph replay

@@ -29,9 +29,9 @@ def make_inputs(op, case):
 def run_correctness(op, build, cases) -> list[dict]:
     results = []
     for case in cases:
-        inputs = make_inputs(op, case)
+        inputs, options = make_inputs(op, case), op.options(case)
         try:
-            failure = check(op, build(*inputs), inputs)
+            failure = check(op, build(*inputs, **options), inputs, options)
         except Exception as e:  # a crash fails the case
             failure = f"{type(e).__name__}: {e}"
         results.append({"case": str(case), "passed": failure is None, "failure": failure})
@@ -39,20 +39,20 @@ def run_correctness(op, build, cases) -> list[dict]:
 
 
 def run_performance(op, build, case, peak_gbps) -> dict:
-    inputs = make_inputs(op, case)
-    fn = build(*inputs)
-    failure = check(op, fn, inputs)
+    inputs, options = make_inputs(op, case), op.options(case)
+    fn = build(*inputs, **options)
+    failure = check(op, fn, inputs, options)
     if failure:
         return {"case": str(case), "passed": False, "failure": failure}
-    g, copies = capture(fn, inputs, op.make_out(*inputs))
+    g, copies = capture(fn, inputs, op.make_out(*inputs, **options))
     us = time_graph(g)
-    failure = check_graph(op, g, copies, make_inputs(op, replace(case, seed=case.seed + 1)))
+    failure = check_graph(op, g, copies, make_inputs(op, replace(case, seed=case.seed + 1)), options)
     if failure:
         return {"case": str(case), "passed": False, "failure": failure}
     # torch is timed in its usual call, which allocates its own output: relu(x, out=) launches
     # relu and then a copy into out. The outputs given to measure only size the L2 rotation.
-    torch_us = measure(lambda *xs, out: op.torch_call(*xs), inputs, op.make_out(*inputs))
-    gbps = op.nbytes(*inputs) / us / 1e3
+    torch_us = measure(lambda *xs, out: op.torch_call(*xs, **options), inputs, op.make_out(*inputs, **options))
+    gbps = op.nbytes(*inputs, **options) / us / 1e3
     return {"case": str(case), "passed": True, "failure": None, "us": us, "gbps": gbps,
             "sol": gbps / peak_gbps, "torch_us": torch_us, "speedup": torch_us / us}
 
@@ -64,10 +64,10 @@ def correctness_cases(op, heldout):
 def run_op(op, heldout, peak) -> dict:
     compile_s = 0.0
 
-    def build(*inputs):  # a kernel compiles when it is built, so the time spent here is compile time
+    def build(*inputs, **options):  # a kernel compiles when it is built, so the time spent here is compile time
         nonlocal compile_s
         start = time.perf_counter()
-        fn = op.build(*inputs)
+        fn = op.build(*inputs, **options)
         compile_s += time.perf_counter() - start
         return fn
 
